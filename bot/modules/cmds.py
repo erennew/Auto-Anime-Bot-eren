@@ -218,3 +218,15 @@ async def broadcast(_, m: Message):
 <b>Success:</b> {success}
 <b>Failed:</b> {len(users) - success}
 """)
+from pyrogram.filters import command, user
+from pyrogram.types import Message
+
+@bot.on_message(command('updateschedule') & user(Var.ADMINS))
+async def manual_trigger(_, m: Message):
+    try:
+        # Call the schedule function
+        await upcoming_animes()  
+        await m.reply("✅ Schedule successfully sent to MAIN_CHANNEL!")
+    except Exception as e:
+        await m.reply(f"❌ Failed to update schedule: {str(e)}")
+        await rep.report(f"Manual schedule update failed: {e}", "error")
