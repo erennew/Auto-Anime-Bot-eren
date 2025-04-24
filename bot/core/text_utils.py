@@ -11,22 +11,18 @@ from .func_utils import handle_logs
 from .reporter import rep
 
 CAPTION_FORMAT = """
-<b>㊂ <i>{title}</i></b>
-<b>╭┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅</b>
-<b>⊙</b> <i>Genres:</i> <i>{genres}</i>
-<b>⊙</b> <i>Status:</i> <i>RELEASING</i> 
-<b>⊙</b> <i>Source:</i> <i>Subsplease</i>
-<b>⊙</b> <i>Episode:</i> <i>{ep_no}</i>
-<b>⊙</b> <i>Audio: Japanese</i>
-<b>⊙</b> <i>Subtitle: English</i>
-<b>╰┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅</b>
-╭┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅
-⌬  <b><i>Powered By</i></b> ~ </i></b><b><i>{cred}</i></b>
-╰┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅
+<b>╭─❖ <i>{title}</i> ❖─╮</b>
+
+<b>├・🌀 <i>Genres:</i></b> <code>{genres}</code>
+<b>├・📡 <i>Status:</i></b> <code>RELEASING</code>
+<b>├・🎞️ <i>Episode:</i></b> <code>{ep_no}</code>
+<b>├・🔊 <i>Audio:</i></b> <code>Japanese</code>
+<b>╰・📝 <i>Subs:</i></b> <code>English</code>
+
+<b>╰─✦ <i>Powered by {cred}</i> ✦─╯</b>
 """
 
-GENRES_EMOJI = {"Action": "👊", "Adventure": choice(['🪂', '🧗‍♀']), "Comedy": "🤣", "Drama": " 🎭", "Ecchi": choice(['💋', '🥵']), "Fantasy": choice(['🧞', '🧞‍♂', '🧞‍♀','🌗']), "Hentai": "🔞", "Horror": "☠", "Mahou Shoujo": "☯", "Mecha": "🤖", "Music": "🎸", "Mystery": "🔮", "Psychological": "♟", "Romance": "💞", "Sci-Fi": "🛸", "Slice of Life": choice(['☘','🍁']), "Sports": "⚽️", "Supernatural": "🫧", "Thriller": choice(['🥶', '🔪','🤯'])}
-
+GENRES_EMOJI = {"Action": choice(["👊", "💥", "🔫"]), "Adventure": choice(["🪂", "🧗‍♀️", "🗺️"]), "Comedy": choice(["🤣", "😂", "😆"]), "Drama": choice(["🎭", "🎬", "🍿"]), "Ecchi": choice(["💋", "🥵", "👙"]), "Fantasy": choice(["🧞", "🧚", "🌌"]), "Hentai": "🔞", "Horror": choice(["☠️", "👻", "🩸"]), "Mahou Shoujo": choice(["☯️", "✨", "🌟"]), "Mecha": choice(["🤖", "🚀", "⚙️"]), "Music": choice(["🎸", "🎹", "🎤"]), "Mystery": choice(["🔮", "🕵️", "🧩"]), "Psychological": choice(["♟️", "🧠", "🌀"]), "Romance": choice(["💞", "💘", "🥰"]), "Sci-Fi": choice(["🛸", "👽", "🚨"]), "Slice of Life": choice(["☘️", "🍁", "🏡"]), "Sports": choice(["⚽️", "🏀", "🎾"]), "Supernatural": choice(["🫧", "🌠", "⚡"]), "Thriller": choice(["🥶", "🔪", "😱"]), "Isekai": choice(["🌐", "🌀", "🚪"]), "Shounen": choice(["💪", "🔥", "⚔️"]), "Shoujo": choice(["💝", "🌸", "🎀"]), "Seinen": choice(["🎩", "📚", "🧐"]), "Josei": choice(["💄", "👠", "💍"]), "Military": choice(["🎖️", "🪖", "🔫"]), "Police": choice(["👮", "🚔", "🚨"]), "Demons": choice(["👹", "😈", "👺"]), "Magic": choice(["🔮", "🪄", "✨"]), "Super Power": choice(["💫", "🦸", "⚡"]), "Vampire": choice(["🧛", "🦇", "🍷"]), "Yaoi": "👬", "Yuri": "👭", "Harem": choice(["💕", "👨‍👩‍👧‍👦", "💑"]), "Military": choice(["🎖️", "🪖", "🔫"]), "Historical": choice(["🏛️", "⏳", "🗡️"]), "Martial Arts": choice(["🥋", "👊", "💪"]), "Parody": choice(["🃏", "🎭", "🤹"]), "Samurai": choice(["🗡️", "🥷", "⚔️"]), "School": choice(["🎒", "📚", "✏️"]), "Space": choice(["🚀", "👽", "🪐"]), "Vampire": choice(["🧛", "🦇", "🍷"]), "Zombies": choice(["🧟", "☠️", "🧠"])}
 ANIME_GRAPHQL_QUERY = """
 query ($id: Int, $search: String, $seasonYear: Int) {
   Media(id: $id, type: ANIME, format_not_in: [MOVIE, MUSIC, MANGA, NOVEL, ONE_SHOT], search: $search, seasonYear: $seasonYear) {
@@ -192,7 +188,7 @@ class TextEditor:
     async def get_poster(self):
         if anime_id := await self.get_id():
             return f"https://img.anili.st/media/{anime_id}"
-        return "https://telegra.ph/file/112ec08e59e73b6189a20.jpg"
+        return "https://files.catbox.moe/xkf42h.jpg"
         
     @handle_logs
     async def get_upname(self, qual=""):
