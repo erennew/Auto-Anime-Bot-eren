@@ -1,5 +1,5 @@
 from asyncio import gather, create_task, sleep as asleep, Event
-from asyncio.subprocess import PIPE
+from asyncio.subprocess import PIPE, create_subprocess_shell
 from os import path as ospath, makedirs
 from aiofiles import open as aiopen
 from aiofiles.os import remove as aioremove
@@ -24,6 +24,16 @@ btn_formatter = {
 
 # Track processed torrents to prevent duplicates
 processed_torrents = set()
+
+# Initialize ani_cache keys if they don't exist
+if not hasattr(ani_cache, 'processing'):
+    ani_cache['processing'] = set()
+if not hasattr(ani_cache, 'ongoing'):
+    ani_cache['ongoing'] = set()
+if not hasattr(ani_cache, 'completed'):
+    ani_cache['completed'] = set()
+if not hasattr(ani_cache, 'fetch_animes'):
+    ani_cache['fetch_animes'] = True
 
 async def fetch_animes():
     """Continuously fetch new anime from RSS feeds with duplicate prevention"""
@@ -66,6 +76,7 @@ async def should_process_anime(ani_id, ep_no, force=False):
 
 async def get_animes(name, torrent, force=False):
     """Main function to handle anime processing pipeline"""
+    episode_id = None
     try:
         aniInfo = TextEditor(name)
         await aniInfo.load_anilist()
@@ -75,6 +86,10 @@ async def get_animes(name, torrent, force=False):
         # Create unique episode identifier
         episode_id = f"{ani_id}_{ep_no}"
         
+        # Initialize processing set if not exists
+        if 'processing' not in ani_cache:
+            ani_cache['processing'] = set()
+            
         # Skip if already processing or completed
         if episode_id in ani_cache['processing'] and not force:
             return
@@ -88,6 +103,10 @@ async def get_animes(name, torrent, force=False):
         if "[Batch]" in name:
             await rep.report(f"⏭️ Batch Torrent Skipped!\n\n📛 {name}", "warning")
             return
+
+        # Initialize ongoing set if not exists
+        if 'ongoing' not in ani_cache:
+            ani_cache['ongoing'] = set()
 
         # Track ongoing anime
         if ani_id not in ani_cache['ongoing']:
@@ -188,12 +207,17 @@ async def get_animes(name, torrent, force=False):
         # Cleanup
         await stat_msg.delete()
         await aioremove(dl)
+        
+        # Initialize completed set if not exists
+        if 'completed' not in ani_cache:
+            ani_cache['completed'] = set()
         ani_cache['completed'].add(ani_id)
         
     except Exception as error:
         await rep.report(f"💥 Critical Error in get_animes!\n{format_exc()}", "error")
     finally:
-        ani_cache['processing'].discard(episode_id)
+        if episode_id and 'processing' in ani_cache:
+            ani_cache['processing'].discard(episode_id)
 
 async def extra_utils(msg_id, out_path, anime_name):
     """Handle additional utilities like backups and screenshots"""
@@ -240,7 +264,8 @@ async def generate_and_send_screenshots(msg_id, video_path, anime_name):
         for i in range(1, 6):
             ss_path = f"{screenshot_dir}/ss_{i:02d}.jpg"
             if ospath.exists(ss_path):
-                media_group.append(InputMediaPhoto(ss_path))
+                async with aiopen(ss_path, 'rb') as f:
+                    media_group.append(InputMediaPhoto(await f.read()))
         
         if media_group:
             await bot.send_media_group(
