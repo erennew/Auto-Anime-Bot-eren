@@ -1,6 +1,6 @@
 from asyncio import sleep as asleep, gather
 from os import path as ospath
-from aiofiles.os import remove as aioremove, rmtree as aiormtree
+from aioshutil import rmtree as aiormtree
 from pyrogram.filters import command, private, user
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from pyrogram.errors import FloodWait
