@@ -49,14 +49,11 @@ class Var:
     
     SEND_SCHEDULE = getenv("SEND_SCHEDULE", "False").lower() == "true"
     BRAND_UNAME = getenv("BRAND_UNAME", "@username")
-  #  FFCODE_1080 = getenv("FFCODE_1080") or """ffmpeg -i '{}' -progress '{}' -preset veryfast -c:v libx264 -s 1920x1080 -pix_fmt yuv420p -crf 30 -c:a libopus -b:a 32k -c:s copy -map 0 -ac 2 -ab 32k -vbr 2 -level 3.1 '{}' -y"""
-    FFCODE_1080 = getenv("FFCODE_1080") or """ffmpeg -i '{}' -progress '{}' -filter_complex "drawtext=text='Cultured Telugu Weeb':x=30:y=30:fontcolor=white@0.5:fontsize=40" -map 0:v -map 0:a -map 0:s -c:v libx265 -crf 26 -s 1920x1080 -b:v 500k -c:a libopus -b:a 64k -preset veryfast -x265-params "log-level=error" -metadata author='@Culturedteluguweeb' -metadata:s:s title='@Culturedteluguweeb' -metadata:s:a title='@Culturedteluguweeb' -metadata:s:v title='@Culturedteluguweeb' -y '{}'"""
-
-    FFCODE_720 = getenv("FFCODE_720") or """ffmpeg -i '{}' -progress '{}' -filter_complex "scale=1280:720:force_original_aspect_ratio=decrease,drawtext=text='Cultured Telugu Weeb':x=30:y=30:fontcolor=white@0.5:fontsize=30:borderw=2:bordercolor=black@0.5" -map 0:v -map 0:a -map 0:s -c:v libx265 -crf 26 -preset veryfast -x265-params "log-level=error:ref=3:bframes=5:no-sao=1" -pix_fmt yuv420p -c:a libopus -b:a 48k -vbr on -c:s copy -metadata author='@Culturedteluguweeb' -metadata:s:s title='@Culturedteluguweeb' -metadata:s:a title='@Culturedteluguweeb' -metadata:s:v title='@Culturedteluguweeb' -y '{}'"""
-
-    FFCODE_480 = getenv("FFCODE_480") or """ffmpeg -i '{}' -progress '{}' -filter_complex "scale=854:480:force_original_aspect_ratio=decrease,drawtext=text='Cultured Telugu Weeb':x=20:y=20:fontsize=24:fontcolor=white@0.7:box=1:boxcolor=black@0.4:shadowx=2:shadowy=2" -map 0:v -map 0:a -map 0:s -c:v libx265 -crf 26 -preset veryfast -x265-params "log-level=error:ref=3:bframes=3:no-sao=1:rc-lookahead=20" -pix_fmt yuv420p -c:a libopus -b:a 32k -vbr on -c:s copy -metadata author='@Culturedteluguweeb' -metadata:s:s title='@Culturedteluguweeb' -metadata:s:a title='@Culturedteluguweeb' -metadata:s:v title='@Culturedteluguweeb' -y '{}'"""
-
-    QUALS = getenv("QUALS", "480 720 1080").split()
+    FFCODE_1080 = getenv("FFCODE_1080") or """ffmpeg -i '{}' -progress '{}' -preset veryfast -c:v libx265 -s 1920x1080 -pix_fmt yuv420p -crf 26 -c:a libopus -b:a 32k -c:s copy -map 0 -ac 2 -ab 32k -vbr 2 -level 3.1 '{}' -y"""
+    FFCODE_720 = getenv("FFCODE_720") or """ffmpeg -i '{}' -progress '{}' -preset superfast -c:v libx265 -s 1280x720 -pix_fmt yuv420p -crf 26 -c:a libopus -b:a 32k -c:s copy -map 0 -ac 2 -ab 32k -vbr 2 -level 3.1 '{}' -y"""
+    FFCODE_480 = getenv("FFCODE_480") or """ffmpeg -i '{}' -progress '{}' -preset superfast -c:v libx265 -s 854x480 -pix_fmt yuv420p -crf 26 -c:a libopus -b:a 32k -c:s copy -map 0 -ac 2 -ab 32k -vbr 2 -level 3.1 '{}' -y"""
+   # FFCODE_360 = getenv("FFCODE_360") or """ffmpeg -i '{}' -progress '{}' -preset superfast -c:v libx264 -s 640x360 -pix_fmt yuv420p -crf 30 -c:a libopus -b:a 32k -c:s copy -map 0 -ac 2 -ab 32k -vbr 2 -level 3.1 '{}' -y"""
+    QUALS = getenv("QUALS", " 480 720 1080").split()
 
     
     AS_DOC = getenv("AS_DOC", "True").lower() == "true"
