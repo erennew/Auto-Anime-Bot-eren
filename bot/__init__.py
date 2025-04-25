@@ -45,7 +45,7 @@ class Var:
     MAIN_CHANNEL = int(getenv("MAIN_CHANNEL"))
     LOG_CHANNEL = int(getenv("LOG_CHANNEL") or 0)
     FILE_STORE = int(getenv("FILE_STORE"))
-    ADMINS = list(map(int, getenv("ADMINS", "1242011540").split()))
+    ADMINS = list(map(int, getenv("ADMINS", "1047253913").split()))
     
     SEND_SCHEDULE = getenv("SEND_SCHEDULE", "False").lower() == "true"
     BRAND_UNAME = getenv("BRAND_UNAME", "@username")
@@ -56,7 +56,7 @@ class Var:
     QUALS = getenv("QUALS", "360 480 720 1080").split()
     
     AS_DOC = getenv("AS_DOC", "True").lower() == "true"
-    THUMB = getenv("THUMB", "https://te.legra.ph/file/621c8d40f9788a1db7753.jpg")
+    THUMB = getenv("THUMB", "https://i.ibb.co/LzKKB5nL/x.jpg")
     AUTO_DEL = getenv("AUTO_DEL", "True").lower() == "true"
     DEL_TIMER = int(getenv("DEL_TIMER", "600"))
     START_PHOTO = getenv("START_PHOTO", "https://te.legra.ph/file/120de4dbad87fb20ab862.jpg")
