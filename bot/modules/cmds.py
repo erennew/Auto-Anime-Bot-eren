@@ -14,6 +14,9 @@ from bot.core.func_utils import (
 from bot.core.auto_animes import get_animes
 from bot.core.reporter import rep
 
+import psutil
+import time
+
 # User Commands
 @bot.on_message(command('start') & private)
 @new_task
@@ -103,7 +106,12 @@ async def send_logs(_, m: Message):
         await m.reply_document("bot.log", caption="📄 <b>Bot Logs</b>")
     except Exception as e:
         await sendMessage(m, f"❌ Failed to get logs: {str(e)}")
-
+@bot.on_message(command('listlinks') & private & user(Var.ADMINS))
+async def list_rss(_, m: Message):
+    """List all active RSS feeds"""
+    msg = ["📜 <b>Active RSS Feeds</b>", "━━━━━━━━━━━━━━"]
+    msg.extend(f"{i+1}. <code>{url}</code>" for i, url in enumerate(Var.RSS_ITEMS))
+    await sendMessage(m, "\n".join(msg) if Var.RSS_ITEMS else "ℹ️ No active feeds")
 @bot.on_message(command('addlink') & private & user(Var.ADMINS))
 @new_task
 async def add_rss(_, m: Message):
@@ -194,14 +202,35 @@ async def show_queue(_, m: Message):
 
 @bot.on_message(command('status') & private & user(Var.ADMINS))
 async def bot_status(_, m: Message):
+    # Calculate ping
+    start_time = time.time()
+    tmp_msg = await sendMessage(m, "🏓 Pinging...")
+    ping_ms = round((time.time() - start_time) * 1000, 2)
+    await tmp_msg.delete()
+
+    # Get system stats
+    cpu_percent = psutil.cpu_percent()
+    ram = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+
     status_msg = [
         "🤖 <b>Bot Status</b>",
+        "━━━━━━━━━━━━━━",
+        f"⏱️ <b>Ping:</b> {ping_ms}ms",
+        "",
+        "🖥️ <b>System</b>",
+        f"• CPU: {cpu_percent}% | {psutil.cpu_count()} cores",
+        f"• RAM: {ram.percent}% | {round(ram.used/1024/1024)}MB/{round(ram.total/1024/1024)}MB",
+        f"• Disk: {disk.percent}% | {round(disk.used/1024/1024)}MB/{round(disk.total/1024/1024)}MB",
+        "",
+        "📊 <b>Operations</b>",
         f"• Fetching: {'✅ ON' if ani_cache['fetch_animes'] else '❌ OFF'}",
         f"• Ongoing: {len(ani_cache['ongoing'])}",
         f"• Completed: {len(ani_cache['completed'])}",
         f"• RSS Feeds: {len(Var.RSS_ITEMS)}",
         f"• Qualities: {', '.join(Var.QUALS)}"
     ]
+
     await sendMessage(m, "\n".join(status_msg))
 
 @bot.on_message(command('clean') & private & user(Var.ADMINS))
