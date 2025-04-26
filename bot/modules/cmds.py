@@ -121,7 +121,46 @@ async def add_rss(_, m: Message):
 <b>URL:</b> <code>{url}</code>
 <b>Total Feeds:</b> {len(Var.RSS_ITEMS)}
 """)
+@bot.on_message(command('removelink') & private & user(Var.ADMINS))
+async def remove_rss(_, m: Message):
+    """Remove an existing RSS feed"""
+    try:
+        if len(m.command) < 2:
+            return await sendMessage(m, "ℹ️ Usage: <code>/removelink [url_or_index]</code>")
 
+        target = m.text.split(maxsplit=1)[1].strip()
+        
+        # Remove by index
+        if target.isdigit():
+            index = int(target) - 1  # Convert to 0-based index
+            if 0 <= index < len(Var.RSS_ITEMS):
+                removed_url = Var.RSS_ITEMS.pop(index)
+                return await sendMessage(m, f"""
+🗑️ <b>Removed Feed</b>
+━━━━━━━━━━━━━━
+<b>Position:</b> {index + 1}
+<b>URL:</b> <code>{removed_url}</code>
+<b>Remaining:</b> {len(Var.RSS_ITEMS)}
+""")
+            else:
+                return await sendMessage(m, f"❌ Invalid index. Current feed count: {len(Var.RSS_ITEMS)}")
+
+        # Remove by URL
+        for i, url in enumerate(Var.RSS_ITEMS):
+            if target in url:  # Partial URL match
+                removed_url = Var.RSS_ITEMS.pop(i)
+                return await sendMessage(m, f"""
+🗑️ <b>Removed Feed</b>
+━━━━━━━━━━━━━━
+<b>URL:</b> <code>{removed_url}</code>
+<b>Remaining:</b> {len(Var.RSS_ITEMS)}
+""")
+
+        return await sendMessage(m, "❌ URL not found in feeds")
+
+    except Exception as e:
+        logger.error(f"Remove RSS Error: {e}")
+        return await sendMessage(m, f"⚠️ Error: {str(e)}")
 @bot.on_message(command('addtask') & private & user(Var.ADMINS))
 @new_task
 async def add_task(_, m: Message):
