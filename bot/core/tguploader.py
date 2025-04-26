@@ -57,7 +57,10 @@ class TgUploader:
             percent = round(current / total * 100, 2)
             speed = current / diff 
             eta = round((total - current) / speed)
-            bar = floor(percent/8)*"█" + (12 - floor(percent/8))*"▒"
+            filled = floor(percent / 10)
+            empty = 10 - filled
+            bar = "🔥" * filled + "❄️" * empty
+
             progress_str = f"""‣ <b>Anime Name :</b> <b><i>{self.__name}</i></b>
 
 ‣ <b>Status :</b> <i>Uploading</i>
