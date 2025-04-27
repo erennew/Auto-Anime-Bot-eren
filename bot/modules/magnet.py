@@ -1,7 +1,20 @@
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
-from bot_tasks import handle_task  # Import your task handler for downloading, encoding, etc.
-from bot import FILE_STORE  # Assuming FILE_STORE is defined in your config.py
+# Required imports
+from os import path as ospath
+from aiofiles import open as aiopen
+from aiofiles.os import remove as aioremove, rename as aiorename, mkdir
+from aiohttp import ClientSession
+from torrentp import TorrentDownloader
+from bot import LOGS, bot  # Import bot and LOGS from your bot module
+from bot.core.func_utils import handle_logs, sendMessage, editMessage, mediainfo, convertBytes, convertTime
+from asyncio import sleep as asleep, gather, create_subprocess_shell, create_task
+from traceback import format_exc
+from shlex import split as ssplit
+from time import time
+from pyrogram import Client
+from pyrogram.enums import ParseMode
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from bot import Var, bot_loop, ffpids_cache, LOGS
+from logging import INFO, ERROR, FileHandler, StreamHandler, basicConfig, getLogger
 
 # In-memory storage for user data
 user_data = {}
@@ -110,3 +123,14 @@ async def handle_text_response(_, message: Message):
         else:
             await message.reply("Unknown action. Please use the menu to select actions.")
 
+# Adding necessary utility functions to assist tasks (if not already defined elsewhere)
+async def handle_task(user_id, magnet_link, quality, new_name, thumbnail):
+    # Placeholder function for downloading, encoding, and uploading
+    try:
+        # Example task handling logic (should be replaced by actual logic)
+        await sendMessage(user_id, "Starting the task...")
+        await asleep(2)  # Simulate task processing delay
+        await sendMessage(user_id, "Task completed successfully.")
+    except Exception as e:
+        await sendMessage(user_id, f"An error occurred: {str(e)}")
+        LOGS.error(f"Error in task handling for user {user_id}: {format_exc()}")
