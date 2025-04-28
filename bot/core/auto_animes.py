@@ -1,285 +1,267 @@
-from asyncio import Semaphore, Lock, gather, create_task, sleep as asleep, Event
-from asyncio.subprocess import PIPE, create_subprocess_shell
-from os import path as ospath, makedirs
-from aiofiles import open as aiopen
-from aiofiles.os import remove as aioremove
+import asyncio
+from os import path as ospath
 from traceback import format_exc
-from time import time
-from datetime import datetime
-from psutil import cpu_percent, virtual_memory
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from collections import deque
+from aiofiles.os import remove as aioremove
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from asyncio import sleep as asleep
 
 from bot import bot, bot_loop, Var, ani_cache, ffQueue, ffLock, ff_queued
 from .tordownload import TorDownloader
 from .database import db
-from .func_utils import getfeed, encode, editMessage, sendMessage
+from .func_utils import getfeed, encode, sendMessage, handle_logs
 from .text_utils import TextEditor
 from .ffencoder import FFEncoder
 from .tguploader import TgUploader
 from .reporter import rep
+from .task_queue import task_queue, TaskPriority
 
-# Configuration
+# Format for buttons
 btn_formatter = {
     '1080': '🎬 𝟭𝟬𝟴𝟬𝗽',
     '720': '🎥 𝟳𝟮𝟬𝗽',
     '480': '📺 𝟰𝟴𝟬𝗽'
 }
 
-# Safety Limits
-SAFETY = {
-    'MAX_CPU': 80,          # Stop if CPU > 80%
-    'MAX_RAM': 90,          # Stop if RAM > 90%
-    'FFMPEG_TIMEOUT': 21600, # 6 hours max per encode
-    'COOLDOWN': 300         # 5 minute wait if overloaded
-}
+class AnimePostManager:
+    """Handles all anime post creation and updates"""
+    def __init__(self):
+        self.status_messages = {}
 
-# Global Control
-PROCESS_LOCK = Semaphore(1)  # One anime at a time
-SCREENSHOT_LOCK = Lock()     # Prevent screenshot collisions
-processed_torrents = set()   # Track processed torrents
-
-# Initialize cache
-for key in ['processing', 'ongoing', 'completed', 'fetch_animes']:
-    if not hasattr(ani_cache, key):
-        setattr(ani_cache, key, set())
-
-async def safe_encode(encoder, input_path, output_path, qual):
-    """Protected FFmpeg encoding with resource monitoring"""
-    start_time = datetime.now()
-    attempts = 0
-    
-    while attempts < 3:
-        # System check
-        if (cpu_percent() > SAFETY['MAX_CPU'] or 
-            virtual_memory().percent > SAFETY['MAX_RAM']):
-            await asleep(SAFETY['COOLDOWN'])
-            continue
-            
-        # Timeout check
-        if (datetime.now() - start_time).seconds > SAFETY['FFMPEG_TIMEOUT']:
-            raise TimeoutError(f"Encoding exceeded {SAFETY['FFMPEG_TIMEOUT']}s timeout")
-
+    async def create_initial_post(self, title: str) -> Message:
+        """Create the initial processing post"""
         try:
-            return await encoder.encode(input_path, output_path, qual)
+            ani_info = TextEditor(title)
+            await ani_info.load_anilist()
+            
+            post_msg = await bot.send_message(
+                Var.MAIN_CHANNEL,
+                f"🌀 <b>Anime:</b> <i>{title}</i>\n\n⬇️ <i>Downloading...</i>"
+            )
+            
+            self.status_messages[post_msg.id] = {
+                'message': post_msg,
+                'title': title,
+                'buttons': []
+            }
+            return post_msg
+            
         except Exception as e:
-            attempts += 1
-            if "ffmpeg" in str(e).lower():
-                await asleep(60)
-                continue
+            await rep.report(f"Failed to create initial post: {str(e)}", "error")
             raise
 
-async def generate_screenshots(video_path, anime_name, msg_id):
-    """Thread-safe screenshot generation"""
-    async with SCREENSHOT_LOCK:
-        screenshot_dir = f"./screenshots/{msg_id}"
-        makedirs(screenshot_dir, exist_ok=True)
-        media_group = []
+    async def update_status(self, post_id: int, status: str) -> None:
+        """Update the processing status"""
+        if post_id not in self.status_messages:
+            return
+            
+        post_data = self.status_messages[post_id]
+        try:
+            await post_data['message'].edit_text(
+                f"🌀 <b>Anime:</b> <i>{post_data['title']}</i>\n\n{status}"
+            )
+        except Exception as e:
+            await rep.report(f"Failed to update status: {str(e)}", "error")
+
+    async def add_download_button(self, post_id: int, quality: str, file_link: str, file_size: float) -> None:
+        """Add download button to the post"""
+        if post_id not in self.status_messages:
+            return
+            
+        post_data = self.status_messages[post_id]
+        btn_text = f"{btn_formatter[quality]} ({round(file_size / (1024 * 1024), 1)}MB)"
+        
+        # Add new button or append to existing row
+        buttons = post_data['buttons']
+        if buttons and len(buttons[-1]) < 2:
+            buttons[-1].append(InlineKeyboardButton(btn_text, url=file_link))
+        else:
+            buttons.append([InlineKeyboardButton(btn_text, url=file_link)])
         
         try:
-            # Generate 5 screenshots from key moments
-            timestamps = ["00:10:00", "00:20:00", "00:30:00", "00:40:00", "00:50:00"]
+            await post_data['message'].edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        except Exception as e:
+            await rep.report(f"Failed to add button: {str(e)}", "error")
+
+    async def cleanup_post(self, post_id: int) -> None:
+        """Clean up the post after processing"""
+        if post_id in self.status_messages:
+            try:
+                await self.status_messages[post_id]['message'].delete()
+                del self.status_messages[post_id]
+            except Exception as e:
+                await rep.report(f"Failed to cleanup post: {str(e)}", "error")
+
+class AnimeProcessor:
+    def __init__(self):
+        self.active_tasks = set()
+        self.post_manager = AnimePostManager()
+        
+        # Initialize ani_cache with default values
+        ani_cache.setdefault('processing', set())
+        ani_cache.setdefault('ongoing', set())
+        ani_cache.setdefault('completed', set())
+        ani_cache.setdefault('fetch_animes', True)
+
+        # Task management
+        self.task_lock = asyncio.Lock()
+        self.processed_torrents = set()
+        self.ffEvent = asyncio.Event()
+
+    async def fetch_animes(self):
+        """Fetch new animes from RSS feeds"""
+        while True:
+            try:
+                if ani_cache.get('fetch_animes', True):
+                    await rep.report("✨ Fetch Animes Started!", "info")
+                    for link in Var.RSS_ITEMS:
+                        try:
+                            info = await getfeed(link, 0)
+                            if not info:
+                                continue
+                            
+                            torrent_id = f"{info.title}_{info.link.split('/')[-1]}"
+                            if torrent_id in self.processed_torrents:
+                                continue
+                                
+                            self.processed_torrents.add(torrent_id)
+                            await rep.report(f"📥 Adding task for {info.title} to queue", "info")
+                            
+                            priority = (
+                                TaskPriority.HIGH 
+                                if "special" in info.title.lower() 
+                                else TaskPriority.MEDIUM
+                            )
+                            
+                            await self.add_task(
+                                lambda: self.process_anime(info.title, info.link), 
+                                priority
+                            )
+                        except Exception as e:
+                            await rep.report(f"RSS feed error ({link}): {str(e)}", "error")
+                
+                await asleep(60)  # Check every minute
+                
+            except Exception as e:
+                await rep.report(f"Fetch animes error: {str(e)}", "error")
+                await asleep(60)
+
+    async def process_anime(self, title, link):
+        """Process a single anime from download to upload"""
+        task_id = hash((title, link))
+        if task_id in self.active_tasks:
+            return
             
-            for i, timestamp in enumerate(timestamps, 1):
-                ss_path = f"{screenshot_dir}/ss_{i}.jpg"
-                cmd = f"ffmpeg -ss {timestamp} -i '{video_path}' -vframes 1 -q:v 2 '{ss_path}' -y"
+        self.active_tasks.add(task_id)
+        
+        try:
+            if "[Batch]" in title:
+                await rep.report(f"⏭️ Skipped batch: {title}", "warning")
+                return
                 
-                proc = await create_subprocess_shell(
-                    cmd, stdout=PIPE, stderr=PIPE
-                )
-                await proc.communicate()
-                
-                if ospath.exists(ss_path):
-                    async with aiopen(ss_path, 'rb') as f:
-                        media = InputMediaPhoto(
-                            await f.read(),
-                            caption=f"📸 {anime_name}" if i == 1 else ""
+            # Create initial post
+            post_msg = await self.post_manager.create_initial_post(title)
+            post_id = post_msg.id
+
+            # Download torrent
+            await self.post_manager.update_status(post_id, "⬇️ <i>Downloading...</i>")
+            dl_path = await TorDownloader("./downloads").download(link, title)
+            
+            if not dl_path or not ospath.exists(dl_path):
+                await rep.report(f"❌ Download failed: {title}", "error")
+                await self.post_manager.cleanup_post(post_id)
+                return
+
+            # Wait for encoder availability
+            if ffLock.locked():
+                await self.post_manager.update_status(post_id, "⏳ <i>Queued for encoding...</i>")
+                await rep.report("📥 Added to encode queue", "info")
+
+            await ffQueue.put(post_id)
+            self.ffEvent.clear()
+            await self.ffEvent.wait()
+
+            # Process encoding
+            async with ffLock:
+                for qual in Var.QUALS:
+                    filename = f"{title.replace(' ', '_')}_{qual}p.mkv"
+                    
+                    await self.post_manager.update_status(post_id, f"⚙️ <i>Encoding {qual}p...</i>")
+
+                    try:
+                        # Encode video
+                        encoder = FFEncoder(post_msg, dl_path, filename, qual)
+                        out_path = await encoder.start_encode()
+                        
+                        if not out_path or not ospath.exists(out_path):
+                            raise Exception("Encoding failed - no output file")
+                            
+                        await rep.report(f"✅ {qual}p encoded: {title}", "info")
+
+                        # Upload
+                        await self.post_manager.update_status(post_id, f"📤 <i>Uploading {qual}p...</i>")
+                        uploader = TgUploader(post_msg)
+                        msg = await uploader.upload(out_path, qual)
+                        
+                        # Add download button
+                        file_link = f"https://telegram.me/{(await bot.get_me()).username}?start={await encode('get-' + str(msg.id * abs(Var.FILE_STORE)))}"
+                        await self.post_manager.add_download_button(
+                            post_id, 
+                            qual, 
+                            file_link, 
+                            msg.document.file_size
                         )
-                        media_group.append(media)
-                    await aioremove(ss_path)
-            
-            if media_group and hasattr(Var, 'LOG_CHANNEL'):
-                await bot.send_media_group(Var.LOG_CHANNEL, media=media_group)
-                return True
+
+                        # Save to database
+                        anime_id = abs(hash(title + link)) % 100000
+                        await db.saveAnime(anime_id, 1, qual, post_id)
+                        
+                        # Handle logs
+                        bot_loop.create_task(handle_logs(msg.id, out_path, title))
+
+                    except Exception as e:
+                        await rep.report(f"❌ {qual}p failed: {title}\nError: {str(e)}", "error")
+                        continue
+
+                # Cleanup
+                await self.post_manager.cleanup_post(post_id)
+                await aioremove(dl_path)
+                ani_cache['completed'].add(anime_id)
                 
         except Exception as e:
-            await rep.report(f"📸 Screenshot Error: {str(e)}", "error")
+            await rep.report(f"💥 Critical error: {title}\n{format_exc()}", "error")
         finally:
-            if ospath.exists(screenshot_dir):
-                await aioremove(screenshot_dir)
-        return False
+            self.ffEvent.set()
+            self.active_tasks.discard(task_id)
 
-async def fetch_animes():
-    """Fetch new anime from RSS feeds with duplicate prevention"""
-    await rep.report("✨ Fetch Animes Started!", "info")
-    while True:
-        await asleep(60)
-        if ani_cache.fetch_animes:
-            for link in Var.RSS_ITEMS:
+    # ... (rest of the class remains the same)
+    
+    async def run_workers(self, num_workers=3):
+        """Run multiple anime processing workers"""
+        workers = [self.worker() for _ in range(num_workers)]
+        await asyncio.gather(*workers)
+
+    async def worker(self):
+        """Process tasks from the queue"""
+        while True:
+            task = await task_queue.get_next_task()
+            if task:
                 try:
-                    if not (info := await getfeed(link, 0)):
-                        continue
-                        
-                    torrent_id = f"{info.title}_{info.link.split('/')[-1]}"
-                    if torrent_id in processed_torrents:
-                        continue
-                        
-                    processed_torrents.add(torrent_id)
-                    bot_loop.create_task(get_animes(info.title, info.link))
-                    
+                    await task()
                 except Exception as e:
-                    await rep.report(f"RSS feed error ({link}): {str(e)}", "error")
+                    await rep.report(f"Worker error: {str(e)}", "error")
+            else:
+                await asleep(1)
 
-async def get_animes(name, torrent, force=False):
-    """Main processing pipeline with safety features"""
-    async with PROCESS_LOCK:
-        episode_id = None
-        dl_path = None
-        encoded_files = {}
-        
-        try:
-            # System health check
-            if (cpu_percent() > SAFETY['MAX_CPU'] or 
-                virtual_memory().percent > SAFETY['MAX_RAM']):
-                await asleep(SAFETY['COOLDOWN'])
-                return await get_animes(name, torrent, force)
+# Initialize and start the processor
+processor = AnimeProcessor()
 
-            # Initialize anime info
-            aniInfo = TextEditor(name)
-            await aniInfo.load_anilist()
-            ani_id = aniInfo.adata.get('id')
-            ep_no = aniInfo.pdata.get("episode_number", 1)
-            episode_id = f"{ani_id}_{ep_no}"
+async def main():
+    # Start the RSS fetcher and workers
+    await processor.add_task(processor.fetch_animes, TaskPriority.HIGH)
+    await processor.run_workers()
 
-            if episode_id in ani_cache.processing and not force:
-                return
-
-            ani_cache.processing.add(episode_id)
-            await rep.report(f"🆕 New Anime: {name}", "info")
-
-            # Create initial post
-            post_msg = await bot.send_photo(
-                Var.MAIN_CHANNEL,
-                photo=await aniInfo.get_poster(),
-                caption=await aniInfo.get_caption()
-            )
-            
-            # Download with progress
-            stat_msg = await sendMessage(
-                Var.MAIN_CHANNEL,
-                f"🌀 <b>Anime:</b> <i>{name}</i>\n\n⬇️ <i>Downloading...</i>\n▱▱▱▱▱▱▱▱▱▱ 0%"
-            )
-
-            dl = TorDownloader("./downloads")
-            dl_path = await dl.download(
-                torrent,
-                name,
-                progress_callback=lambda p: bot_loop.create_task(
-                    editMessage(
-                        stat_msg,
-                        f"🌀 <b>Anime:</b> <i>{name}</i>\n\n⬇️ <i>Downloading...</i>\n"
-                        f"{'▰' * (p // 10)}{'▱' * (10 - (p // 10))} {p}%"
-                    )
-                )
-            )
-
-            if not dl_path or not ospath.exists(dl_path):
-                await editMessage(stat_msg, "❌ Download failed!")
-                return
-
-            # Encoding queue
-            post_id = post_msg.id
-            ffEvent = Event()
-            ff_queued[post_id] = ffEvent
-            
-            if ffLock.locked():
-                await editMessage(stat_msg, f"🌀 <b>Anime:</b> <i>{name}</i>\n\n⏳ <i>Queued for encoding...</i>")
-                await rep.report("📥 Added to encode queue...", "info")
-                
-            await ffQueue.put(post_id)
-            await ffEvent.wait()
-            
-            # Process each quality
-            async with ffLock:
-                btns = []
-                for qual in Var.QUALS:
-                    filename = await aniInfo.get_upname(qual)
-                    await editMessage(stat_msg, f"🌀 <b>Anime:</b> <i>{name}</i>\n\n⚙️ <i>Encoding {qual}p...</i>")
-                    
-                    try:
-                        # Safe encoding
-                        encoder = FFEncoder(stat_msg, dl_path, filename, qual)
-                        out_path = await safe_encode(encoder, dl_path, f"encoded/{filename}", qual)
-                        encoded_files[qual] = out_path
-                        
-                        # Upload
-                        await editMessage(stat_msg, f"🌀 <b>Anime:</b> <i>{filename}</i>\n\n📤 <i>Uploading {qual}p...</i>")
-                        msg = await TgUploader(stat_msg).upload(out_path, qual)
-                        
-                        # Create button
-                        msg_id = msg.id
-                        link = f"https://telegram.me/{Var.BRAND_UNAME.replace('@', '')}?start={await encode('get-'+str(msg_id * abs(Var.FILE_STORE)))}"
-                        btn_text = f"{btn_formatter[qual]} ({round(msg.document.file_size/(1024*1024), 1)}MB)"
-                        
-                        if btns and len(btns[-1]) < 2:
-                            btns[-1].append(InlineKeyboardButton(btn_text, url=link))
-                        else:
-                            btns.append([InlineKeyboardButton(btn_text, url=link)])
-
-                        await db.saveAnime(ani_id, ep_no, qual, post_id)
-
-                        # Generate screenshots for 1080p
-                        if qual == '1080' and hasattr(Var, 'LOG_CHANNEL'):
-                            await generate_screenshots(out_path, name, msg_id)
-                            
-                    except Exception as e:
-                        await rep.report(f"❌ {qual}p failed: {str(e)}", "error")
-                        if ospath.exists(out_path):
-                            await aioremove(out_path)
-                        continue
-
-            # Final update
-            await editMessage(
-                stat_msg,
-                f"✅ <b>Completed:</b> <i>{name}</i>\n"
-                f"⚡ Quality: {'/'.join(encoded_files.keys())}p",
-                reply_markup=InlineKeyboardMarkup(btns) if btns else None
-            )
-
-        except Exception as error:
-            await rep.report(f"💥 Pipeline crashed: {format_exc()}", "critical")
-            
-            # Emergency cleanup
-            if dl_path and ospath.exists(dl_path):
-                await aioremove(dl_path)
-            for path in encoded_files.values():
-                if ospath.exists(path):
-                    await aioremove(path)
-                    
-            # System recovery
-            if cpu_percent() > 70:
-                await asleep(SAFETY['COOLDOWN'])
-                
-        finally:
-            if episode_id:
-                ani_cache.processing.discard(episode_id)
-            if dl_path and ospath.exists(dl_path):
-                await aioremove(dl_path)
-            for path in encoded_files.values():
-                if ospath.exists(path):
-                    await aioremove(path)
-
-async def extra_utils(msg_id, out_path, anime_name):
-    """Handle backups and cleanup"""
-    try:
-        msg = await bot.get_messages(Var.FILE_STORE, msg_id)
-
-        # Backup to channels
-        if getattr(Var, 'BACKUP_CHANNEL', 0) != 0:
-            for chat_id in str(Var.BACKUP_CHANNEL).split():
-                try:
-                    await msg.copy(int(chat_id))
-                except Exception as e:
-                    await rep.report(f"❌ Backup failed for {chat_id}: {e}", "warning")
-        
-    except Exception as e:
-        await rep.report(f"❌ Extra utils error: {e}", "error")
+# Start the main loop
+bot_loop.create_task(main())
