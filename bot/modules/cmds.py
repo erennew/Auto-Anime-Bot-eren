@@ -4,7 +4,6 @@ from aioshutil import rmtree as aiormtree
 from pyrogram.filters import command, private, user
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from pyrogram.errors import FloodWait
-
 from bot import bot, bot_loop, Var, ani_cache, ffQueue, ffLock
 from bot.core.database import db
 from bot.core.func_utils import (
@@ -13,7 +12,7 @@ from bot.core.func_utils import (
 )
 from bot.core.auto_animes import get_animes
 from bot.core.reporter import rep
-
+from bot.modules.anime.processor import process_anime
 import psutil
 import time
 
@@ -170,7 +169,6 @@ async def remove_rss(_, m: Message):
         logger.error(f"Remove RSS Error: {e}")
         return await sendMessage(m, f"⚠️ Error: {str(e)}")
 @bot.on_message(command('addtask') & private & user(Var.ADMINS))
-@new_task
 async def add_task(_, m: Message):
     if len(m.command) < 2:
         return await sendMessage(m, "ℹ️ Usage: <code>/addtask [url] (index)</code>")
@@ -179,17 +177,24 @@ async def add_task(_, m: Message):
     url = args[1]
     index = int(args[2]) if len(args) > 2 and args[2].isdigit() else 0
     
-    if not (task := await getfeed(url, index)):
-        return await sendMessage(m, "❌ Failed to fetch torrent!")
-    
-    bot_loop.create_task(get_animes(task.title, task.link, force=True))
-    await sendMessage(m, f"""
+    try:
+        task = await getfeed(url, index)
+        if not task:
+            return await sendMessage(m, "❌ Failed to fetch torrent!")
+        
+        # Run processing in the bot loop
+        bot_loop.create_task(process_anime(task.title, task.link, force=True))
+        
+        await sendMessage(m, f"""
 🎬 <b>Manual Task Added</b>
 ━━━━━━━━━━━━━━
-<b>Title:</b> {task.title}
+<b>Title:</b> <code>{task.title}</code>
 <b>URL:</b> <code>{url}</code>
 <b>Index:</b> {index}
 """)
+    
+    except Exception as e:
+        await sendMessage(m, f"⚠️ Error: <code>{str(e)}</code>")
 
 @bot.on_message(command('queue') & private & user(Var.ADMINS))
 async def show_queue(_, m: Message):
