@@ -8,8 +8,8 @@ from bot.core.text_utils import TextEditor
 from bot.core.reporter import rep
 
 
-from pyrogram.enums import ParseMode  # Add this import at the top
-
+from pyrogram.enums import ParseMode  
+global TD_SCHR=None
 async def upcoming_animes():
     """Post today's anime schedule with clean formatting"""
     global TD_SCHR
