@@ -270,9 +270,11 @@ class AnimeProcessor:
         """Process the encoding queue"""
         while True:
             try:
-                priority, post_id = await ffQueue.get()
-                if post_id in self.ff_events:
-                    self.ff_events[post_id].set()
+                priority, task_coro = await ffQueue.get()
+                try:
+                    await task_coro()  # 🚀 Run the coroutine
+                except Exception as e:
+                    await rep.report(f"Queue task error: {e}", "error")
                 ffQueue.task_done()
             except Exception as e:
                 await rep.report(f"Queue processing error: {str(e)}", "error")
