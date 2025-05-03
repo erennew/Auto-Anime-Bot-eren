@@ -11,7 +11,7 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, RPCError
 from torrentp import TorrentDownloader
 from datetime import datetime
-
+from multiprocessing import Process
 # Bot configuration
 API_ID = 24500584
 API_HASH = "449da69cf4081dc2cc74eea828d0c490"
@@ -51,84 +51,8 @@ active_tasks: Dict[int, asyncio.Task] = {}
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 class VideoEncoder:
-    """Enhanced video encoder with HEVC to H.264 conversion"""
+    """Video processing without any video probing"""
     
-    @staticmethod
-    async def get_video_info(input_path: str) -> Tuple[float, Tuple[int, int]]:
-        """Get video duration and resolution with robust error handling"""
-        try:
-            # First try to get duration and resolution together
-            cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-select_streams', 'v:0',
-                '-show_entries', 'stream=width,height,duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                input_path
-            ]
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode == 0:
-                info = stdout.decode().strip().split('\n')
-                if len(info) >= 3:
-                    width, height, duration = info[:3]
-                    return float(duration), (int(width), int(height))
-            
-            # Fallback to separate commands if combined fails
-            duration_cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                input_path
-            ]
-            
-            duration_process = await asyncio.create_subprocess_exec(
-                *duration_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            duration_out, _ = await duration_process.communicate()
-            duration = float(duration_out.decode().strip()) if duration_process.returncode == 0 else 0
-            
-            # Get resolution separately
-            res_cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-select_streams', 'v:0',
-                '-show_entries', 'stream=width,height',
-                '-of', 'csv=p=0',
-                input_path
-            ]
-            
-            res_process = await asyncio.create_subprocess_exec(
-                *res_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            res_out, _ = await res_process.communicate()
-            if res_process.returncode == 0:
-                try:
-                    width, height = res_out.decode().strip().split(',')
-                    return duration, (int(width), int(height))
-                except:
-                    pass
-            
-            return duration, (0, 0)
-            
-        except Exception as e:
-            logger.error(f"Video info detection failed: {str(e)}")
-            return 0.0, (0, 0)
-
     @staticmethod
     async def encode_with_progress(
         input_path: str,
@@ -139,148 +63,116 @@ class VideoEncoder:
         thumbnail_path: Optional[str] = None,
         progress_callback: Optional[Callable[[float], None]] = None
     ) -> str:
-        """Convert HEVC to H.264 with proper handling"""
+        """Process video with live progress updates"""
         async with semaphore:
             try:
-                # Validate input
+                # 1. Basic validation
                 if not ospath.exists(input_path):
-                    raise FileNotFoundError(f"Input file not found: {input_path}")
+                    raise FileNotFoundError(f"Input file missing: {input_path}")
                 
-                if ospath.getsize(input_path) > MAX_FILE_SIZE:
-                    raise ValueError(f"File too large (>{MAX_FILE_SIZE/1024/1024}MB)")
+                # 2. Build base command
+                cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', input_path]
                 
-                # Get video info with fallback
-                duration, (width, height) = await VideoEncoder.get_video_info(input_path)
-                if duration <= 0:
-                    logger.warning("Could not determine video duration, using fallback method")
-                    duration = 3600  # Default 1 hour if duration can't be determined
+                # 3. Original quality - just remux
+                if quality == 'original':
+                    if watermark_path and ospath.exists(watermark_path):
+                        cmd.extend([
+                            '-i', watermark_path,
+                            '-filter_complex', '[0:v][1:v]overlay=W-w-10:H-h-10[outv]',
+                            '-map', '[outv]'
+                        ])
+                    else:
+                        cmd.extend(['-map', '0:v?'])
+                    
+                    cmd.extend([
+                        '-map', '0:a?',
+                        '-c', 'copy',  # Stream copy
+                        '-metadata', f'title={metadata.get("title", "")}',
+                        '-f', 'matroska',
+                        '-y',
+                        output_path
+                    ])
                 
-                # Quality presets for H.264 output
-                presets = {
-                    '480p': {'height': 480, 'crf': 23, 'preset': 'fast'},
-                    '720p': {'height': 720, 'crf': 21, 'preset': 'medium'},
-                    '1080p': {'height': 1080, 'crf': 20, 'preset': 'slow'},
-                    'original': {'crf': 20, 'preset': 'medium'}
-                }
-                
-                if quality not in presets:
-                    raise ValueError(f"Invalid quality: {quality}")
-                
-                # Base FFmpeg command for H.264 conversion
-                cmd = [
-                    'ffmpeg',
-                    '-hide_banner',
-                    '-loglevel', 'error',
-                    '-i', input_path,
-                    '-c:v', 'libx264',  # Force H.264 codec
-                    '-pix_fmt', 'yuv420p',  # Ensure 8-bit output
-                    '-movflags', '+faststart',
-                    '-c:a', 'aac',
-                    '-b:a', '192k',
-                    '-metadata', f'title={metadata.get("title", "")}',
-                    '-y',
-                    output_path
-                ]
-                
-                # Apply quality settings
-                if quality != 'original':
-                    cmd[4:4] = [
-                        '-vf', f'scale=-2:{presets[quality]["height"]}',
-                        '-crf', str(presets[quality]["crf"]),
-                        '-preset', presets[quality]["preset"]
-                    ]
+                # 4. Other qualities - apply compression
                 else:
-                    # For original quality, just ensure proper conversion
-                    cmd[4:4] = [
-                        '-crf', str(presets[quality]["crf"]),
-                        '-preset', presets[quality]["preset"]
-                    ]
+                    quality_settings = {
+                        '480p': {'scale': '480', 'crf': 23},
+                        '720p': {'scale': '720', 'crf': 21}, 
+                        '1080p': {'scale': '1080', 'crf': 20}
+                    }
+                    
+                    if quality not in quality_settings:
+                        raise ValueError(f"Invalid quality: {quality}")
+                    
+                    filters = []
+                    video_map = '[0:v]'
+                    
+                    # Add watermark if exists
+                    if watermark_path and ospath.exists(watermark_path):
+                        cmd.extend(['-i', watermark_path])
+                        filters.append(f'[0:v][1:v]overlay=W-w-10:H-h-10[wm]')
+                        filters.append(f'[wm]scale=-2:{quality_settings[quality]["scale"]}[outv]')
+                        video_map = '[outv]'
+                    else:
+                        filters.append(f'[0:v]scale=-2:{quality_settings[quality]["scale"]}[outv]')
+                        video_map = '[outv]'
+
+                    
+                    cmd.extend([
+                        '-filter_complex', ';'.join(filters),
+                        '-map', video_map,
+                        '-map', '0:a?',
+                        '-c:v', 'libx264',
+                        '-preset', 'fast',
+                        '-crf', str(quality_settings[quality]["crf"]),
+                        '-c:a', 'aac',
+                        '-b:a', '192k',
+                        '-metadata', f'title={metadata.get("title", "")}',
+                        '-f', 'matroska',
+                        '-y',
+                        output_path
+                    ])
                 
-                # Add watermark if provided
-                if watermark_path and ospath.exists(watermark_path):
-                    cmd[4:4] = [
-                        '-i', watermark_path,
-                        '-filter_complex', '[0:v][1:v]overlay=W-w-10:H-h-10[out]',
-                        '-map', '[out]',
-                        '-map', '0:a?'
-                    ]
-                else:
-                    # Ensure proper mapping when no watermark
-                    cmd[4:4] = ['-map', '0']
-                
-                logger.info(f"Executing FFmpeg command: {' '.join(cmd)}")
-                
-                # Start encoding process
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                
-                # Progress tracking
-                start_time = time.time()
-                last_progress = 0
-                stderr_lines = []
-                
+                # 5. Execute command with progress tracking
+                logger.info(f"Running: {' '.join(cmd)}")
+                process = await asyncio.create_subprocess_exec(*cmd)
+                start = time.time()
+
                 while True:
-                    line = await process.stderr.readline()
-                    if not line:
+                    returncode = await process.wait()
+                    if returncode is not None:
                         break
-                    
-                    line = line.decode('utf-8').strip()
-                    stderr_lines.append(line)
-                    
-                    # Improved progress parsing
-                    if "time=" in line:
-                        try:
-                            time_str = line.split("time=")[1].split()[0]
-                            h, m, s = time_str.split(':')
-                            current_time = int(h)*3600 + int(m)*60 + float(s)
-                            progress = min(99, (current_time / duration) * 100)
-                            
-                            if progress - last_progress >= 1 or progress >= 99:
-                                if progress_callback:
-                                    await progress_callback(progress)
-                                last_progress = progress
-                        except Exception as e:
-                            logger.warning(f"Progress parsing error: {str(e)}")
-                            continue
+                    elapsed = time.time() - start
+                    if progress_callback:
+                        await progress_callback(min(90, elapsed * 1.5))
+                    await asyncio.sleep(5)
+
+                                
+                # 7. Verify success
+                if process.returncode != 0:
+                    raise RuntimeError("FFmpeg processing failed")
                 
-                # Verify completion
-                returncode = await process.wait()
-                if returncode != 0:
-                    error = '\n'.join(stderr_lines[-10:])  # Show last 10 error lines
-                    raise RuntimeError(f"FFmpeg error: {error}")
-                
-                # Verify output
-                if not ospath.exists(output_path) or ospath.getsize(output_path) == 0:
-                    raise RuntimeError("Encoding failed - empty output file")
-                
-                # Final progress update
                 if progress_callback:
                     await progress_callback(100)
                 
                 return output_path
-            
+                
             except Exception as e:
-                logger.error(f"Encoding failed: {str(e)}", exc_info=True)
+                logger.error(f"Processing error: {e}")
                 if ospath.exists(output_path):
                     try:
                         osremove(output_path)
                     except:
                         pass
-                raise
-
-# [Rest of your existing code remains the same - all the handler functions, etc.]
-# Only the VideoEncoder class has been modified to properly handle HEVC to H.264 conversion
+                raise RuntimeError(f"Failed: {e}")
 
 async def update_progress(chat_id: int, text: str, force_new: bool = False):
-    """Enhanced progress updater with rate limiting and better formatting"""
+    """Update progress message with rate limiting"""
     try:
         now = time.time()
         if chat_id in progress_messages:
             last_update = user_sessions.get(chat_id, {}).get("last_progress_update", 0)
-            if not force_new and (now - last_update < 2):  # More frequent updates
+            if not force_new and (now - last_update < 2):
                 return
             
         if chat_id in progress_messages and not force_new:
@@ -294,9 +186,8 @@ async def update_progress(chat_id: int, text: str, force_new: bool = False):
                 return
             except FloodWait as e:
                 await asyncio.sleep(e.value)
-            except RPCError as e:
-                if "MESSAGE_NOT_MODIFIED" not in str(e):
-                    raise
+            except RPCError:
+                pass
         
         msg = await bot.send_message(chat_id, text)
         progress_messages[chat_id] = msg.id
@@ -325,7 +216,7 @@ async def ask_for_quality(chat_id: int):
     )
 
 async def collect_settings(chat_id: int):
-    """Enhanced settings menu with more options"""
+    """Show settings menu"""
     buttons = [
         [
             InlineKeyboardButton("📏 Quality", callback_data=f"set_quality_{chat_id}"),
@@ -339,7 +230,6 @@ async def collect_settings(chat_id: int):
             InlineKeyboardButton("🚀 Start", callback_data=f"confirm_download_{chat_id}")
         ]
     ]
-    
     await bot.send_message(
         chat_id,
         "⚙️ <b>Encoding Settings</b>\n\nConfigure your video options:",
@@ -347,7 +237,7 @@ async def collect_settings(chat_id: int):
     )
 
 async def handle_download(chat_id: int, magnet_link: str):
-    """Enhanced download handler with better progress tracking"""
+    """Handle torrent download with progress"""
     try:
         if chat_id not in user_sessions or user_sessions[chat_id].get("status") != "ready_to_download":
             return await bot.send_message(chat_id, "❌ Settings not configured")
@@ -359,16 +249,14 @@ async def handle_download(chat_id: int, magnet_link: str):
 
         # Initialize downloader
         downloader = TorrentDownloader(magnet_link, download_path)
-        
         user_sessions[chat_id].update({
             "status": "downloading",
             "download_path": download_path,
             "downloader": downloader,
-            "start_time": time.time(),
-            "last_update": time.time()
+            "start_time": time.time()
         })
 
-        # Start download in background
+        # Start download
         download_task = asyncio.create_task(downloader.start_download())
         active_tasks[chat_id] = download_task
 
@@ -376,11 +264,8 @@ async def handle_download(chat_id: int, magnet_link: str):
         last_size = 0
         while not download_task.done():
             await asyncio.sleep(10)
-            
             try:
                 current_size = sum(f.stat().st_size for f in Path(download_path).rglob('*') if f.is_file())
-                
-                # Calculate progress
                 elapsed = time.time() - user_sessions[chat_id]["start_time"]
                 speed = (current_size - last_size) / elapsed / 1024 if elapsed > 0 else 0
                 
@@ -391,18 +276,14 @@ async def handle_download(chat_id: int, magnet_link: str):
                     f"🚀 Speed: {speed:.1f} KB/s\n"
                     f"📦 Downloaded: {current_size/(1024*1024):.1f} MB"
                 )
-                
                 last_size = current_size
-                user_sessions[chat_id]["last_update"] = time.time()
-                
             except Exception as e:
                 logger.warning(f"Progress update error: {str(e)}")
-                continue
 
         await download_task
         del active_tasks[chat_id]
         
-        # Verify download
+        # Get largest downloaded file
         downloaded_files = [
             (f.stat().st_size, str(f)) 
             for f in Path(download_path).rglob('*') 
@@ -429,28 +310,28 @@ async def handle_download(chat_id: int, magnet_link: str):
             active_tasks.pop(chat_id, None)
 
 async def start_processing(chat_id: int):
-    """Enhanced processing with better error recovery"""
+    """Handle video processing and upload"""
     try:
         session = user_sessions.get(chat_id)
         if not session or session["status"] != "downloaded":
             return await update_progress(chat_id, "❌ No downloaded files found", force_new=True)
         
         file_path = session["file_path"]
-        output_path = ospath.join("encoded", f"encoded_{ospath.basename(file_path)}.mp4")
+        output_path = ospath.join("encoded", f"encoded_{ospath.basename(file_path)}.mkv")
         
-        await update_progress(chat_id, "🔄 Starting video encoding...")
+        await update_progress(chat_id, "🔄 Starting video processing...")
         
         async def progress_callback(progress: float):
-            """Enhanced progress callback"""
+            """Update processing progress"""
             await update_progress(
                 chat_id,
-                f"🔧 Encoding in progress...\n"
-                f"📊 Status: {progress:.1f}% complete\n"
+                f"🔧 Processing...\n"
+                f"📊 Progress: {progress:.1f}%\n"
                 f"📁 File: {ospath.basename(file_path)}"
             )
         
         try:
-            # Run encoding
+            # Process video
             encoded_path = await VideoEncoder.encode_with_progress(
                 input_path=file_path,
                 output_path=output_path,
@@ -463,21 +344,28 @@ async def start_processing(chat_id: int):
             
             # Upload with progress
             await update_progress(chat_id, "☁️ Starting video upload...")
+            
+            # Upload callback
+            async def upload_progress(current, total):
+                progress = (current / total) * 100
+                await update_progress(
+                    chat_id,
+                    f"📤 Uploading...\n"
+                    f"📊 Progress: {progress:.1f}%\n"
+                    f"🔼 {current//(1024*1024)}MB / {total//(1024*1024)}MB"
+                )
+            
+            # Send video (Pyrogram will detect properties automatically)
             await bot.send_video(
                 chat_id=chat_id,
                 video=encoded_path,
                 thumb=session.get("thumbnail"),
                 caption=f"🎬 {session.get('metadata', {}).get('title', 'Video')}",
-                duration=int(await VideoEncoder.get_video_info(encoded_path)[0]),
-                width=(await VideoEncoder.get_video_info(encoded_path)[1])[0],
-                height=(await VideoEncoder.get_video_info(encoded_path)[1])[1],
-                progress=lambda c, t: asyncio.create_task(
-                    update_progress(chat_id, f"📤 Upload progress: {c/t*100:.1f}%")
-                )
+                progress=upload_progress
             )
             
         except Exception as e:
-            raise Exception(f"Encoding failed: {str(e)}")
+            raise Exception(f"Processing failed: {str(e)}")
         finally:
             # Cleanup
             try:
@@ -499,7 +387,6 @@ async def start_processing(chat_id: int):
         user_sessions.pop(chat_id, None)
         progress_messages.pop(chat_id, None)
         active_tasks.pop(chat_id, None)
-
 async def cleanup_temp_files():
     """Enhanced cleanup with better resource management"""
     while True:
@@ -698,13 +585,10 @@ async def status_handler(client: Client, message: Message):
         await message.reply("ℹ️ No active session")
 
 if __name__ == "__main__":
-    logger.info("Starting enhanced video encoder bot...")
+    logger.info("Starting video encoder bot...")
     try:
-        # Initialize cleanup task
         loop = asyncio.get_event_loop()
         loop.create_task(cleanup_temp_files())
-        
-        # Start the bot
         bot.run()
     except Exception as e:
         logger.critical(f"Bot crashed: {str(e)}", exc_info=True)
