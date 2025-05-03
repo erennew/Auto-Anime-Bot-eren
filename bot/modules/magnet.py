@@ -13,6 +13,7 @@ from pyrogram.errors import FloodWait, RPCError
 from torrentp import TorrentDownloader
 from datetime import datetime
 import humanize
+import threading
 
 # Bot configuration
 API_ID = 24500584
@@ -130,9 +131,9 @@ class VideoEncoder:
                     cmd.extend(['-c:v', 'copy'])
                 else:
                     presets = {
-                        '480p': {'height': 480, 'crf': 23, 'preset': 'fast'},
-                        '720p': {'height': 720, 'crf': 21, 'preset': 'medium'},
-                        '1080p': {'height': 1080, 'crf': 20, 'preset': 'slow'}
+                        '480p': {'height': 480, 'crf': 28, 'preset': 'veryfast'},
+                        '720p': {'height': 720, 'crf': 27, 'preset': 'veryfast'},
+                        '1080p': {'height': 1080, 'crf': 26, 'preset': 'veryfast'}
                     }
                     
                     if quality not in presets:
@@ -274,21 +275,16 @@ async def update_progress(
         progress_messages[chat_id] = msg.id  # Changed from msg.message_id to msg.id
     except Exception as e:
         logger.error(f"Failed to update progress: {str(e)}")
-
 async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, List[Dict]]:
-    """Download torrent and return list of all files with video files prioritized"""
+    """Download torrent and return list of files"""
+    download_dir = ospath.join("downloads", f"dl_{chat_id}_{int(time.time())}")
+    makedirs(download_dir, exist_ok=True)
+    
     try:
-        await update_progress(chat_id, "🔍 Analyzing torrent metadata...")
+        await update_progress(chat_id, "🔍 Initializing torrent download...")
         
-        # Create download directory
-        download_dir = ospath.join("downloads", f"dl_{chat_id}_{int(time.time())}")
-        makedirs(download_dir, exist_ok=True)
-        
-        # Initialize torrent downloader
         torrent_downloader = TorrentDownloader(magnet_link, download_dir)
-        
-        # Start download with progress tracking
-        await update_progress(chat_id, "⬇️ Starting torrent download...")
+        download_complete = asyncio.Event()
         
         def progress_callback(progress: float, downloaded: int, upload: int, peers: int):
             asyncio.create_task(
@@ -302,46 +298,78 @@ async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, 
                     progress=progress
                 )
             )
+            if progress >= 100:
+                download_complete.set()
+
+        def start_download():
+            try:
+                torrent_downloader.start_download(progress_callback=progress_callback)
+            except Exception as e:
+                logger.error(f"Download error: {str(e)}")
+                download_complete.set()
+
+        download_thread = threading.Thread(target=start_download)
+        download_thread.start()
+
+        try:
+            await asyncio.wait_for(download_complete.wait(), timeout=1800)
+        except asyncio.TimeoutError:
+            raise ValueError("Torrent download timed out after 30 minutes")
+
+        await update_progress(chat_id, "✅ Torrent download complete! Scanning files...")
         
-        # Start download
-        download_task = asyncio.create_task(
-            asyncio.to_thread(torrent_downloader.start_download, progress_callback=progress_callback)
-        )
-        
-        # Wait for download to complete
-        while not download_task.done():
-            await asyncio.sleep(5)
-        
-        await update_progress(chat_id, "✅ Torrent download complete!")
-        
-        # Find all files in the download directory
         all_files = []
-        video_extensions = ('.mkv', '.mp4', '.avi', '.mov', '.flv', '.wmv', '.webm')
-        
         for root, _, files in os.walk(download_dir):
             for file in files:
                 file_path = ospath.join(root, file)
-                file_info = {
-                    'name': file,
-                    'size': ospath.getsize(file_path),
-                    'path': file_path,
-                    'is_video': file.lower().endswith(video_extensions)
-                }
-                all_files.append(file_info)
-        
+                if not file.startswith('.'):  # Skip hidden files
+                    all_files.append({
+                        'name': file,
+                        'size': ospath.getsize(file_path),
+                        'path': file_path,
+                        'is_video': file.lower().endswith(('.mkv', '.mp4', '.avi', '.mov', '.flv', '.wmv', '.webm'))
+                    })
+
         if not all_files:
-            raise ValueError("No files found in torrent")
-        
-        # Sort files with videos first
-        all_files.sort(key=lambda x: not x['is_video'])
+            raise ValueError("Download completed but no files found")
         
         return download_dir, all_files
         
     except Exception as e:
-        logger.error(f"Torrent download failed: {str(e)}", exc_info=True)
-        if 'download_dir' in locals() and ospath.exists(download_dir):
+        logger.error(f"Torrent download failed: {str(e)}")
+        if ospath.exists(download_dir):
             shutil.rmtree(download_dir, ignore_errors=True)
         raise
+
+async def handle_download(chat_id: int, magnet_link: str):
+    """Handle the complete download process"""
+    try:
+        await update_progress(chat_id, "🔄 Starting download process...")
+        
+        try:
+            download_dir, files = await handle_torrent_download(chat_id, magnet_link)
+        except ValueError as e:
+            error_msg = str(e)
+            if "no files" in error_msg.lower():
+                await update_progress(chat_id, "❌ Torrent contains no files", force_new=True)
+            elif "timed out" in error_msg.lower():
+                await update_progress(chat_id, "❌ Download timed out after 30 minutes", force_new=True)
+            else:
+                await update_progress(chat_id, f"❌ Download failed: {error_msg}", force_new=True)
+            return
+        
+        user_sessions[chat_id].update({
+            "download_path": download_dir,
+            "status": "batch_downloaded" if len(files) > 1 else "downloaded",
+            "files": files,
+            "file_path": files[0]['path'] if files else None
+        })
+        
+        await start_processing(chat_id)
+        
+    except Exception as e:
+        logger.error(f"Download failed: {str(e)}")
+        await update_progress(chat_id, f"❌ Download failed: {str(e)}", force_new=True)
 async def process_single_file(
     chat_id: int,
     file_path: str,
@@ -649,27 +677,72 @@ async def collect_settings(chat_id: int):
     )
 
 async def handle_download(chat_id: int, magnet_link: str):
-    """Handle torrent download and processing"""
+    """Handle torrent download with comprehensive error reporting"""
     try:
-        await update_progress(chat_id, "Starting download...")
+        await update_progress(chat_id, "🔄 Starting download process...")
         
-        # Download torrent
-        download_dir, video_files = await handle_torrent_download(chat_id, magnet_link)
+        try:
+            download_dir, files = await handle_torrent_download(chat_id, magnet_link)
+        except ValueError as e:
+            error_msg = str(e)
+            
+            if "directory is empty" in error_msg:
+                await update_progress(
+                    chat_id,
+                    "❌ Torrent appears to be empty or invalid\n"
+                    "This could mean:\n"
+                    "1. The torrent contains no files\n"
+                    "2. The magnet link is invalid\n"
+                    "3. The torrent is private or requires authentication",
+                    force_new=True
+                )
+            elif "no accessible files" in error_msg:
+                await update_progress(
+                    chat_id,
+                    "❌ Could not access downloaded files\n"
+                    "This could be due to:\n"
+                    "1. Permission issues\n"
+                    "2. Corrupted download\n"
+                    "3. Filesystem problems",
+                    force_new=True
+                )
+            elif "timed out" in error_msg:
+                await update_progress(
+                    chat_id,
+                    "❌ Download timed out after 30 minutes\n"
+                    "Possible reasons:\n"
+                    "1. Slow connection\n"
+                    "2. No seeders available\n"
+                    "3. Torrent is too large",
+                    force_new=True
+                )
+            else:
+                await update_progress(
+                    chat_id,
+                    f"❌ Download failed: {error_msg}\n"
+                    "Please try again or check the magnet link",
+                    force_new=True
+                )
+            return
         
-        # Update session
+        # Update session and start processing
         user_sessions[chat_id].update({
             "download_path": download_dir,
-            "status": "batch_downloaded" if len(video_files) > 1 else "downloaded",
-            "files": video_files,
-            "file_path": video_files[0]['path'] if video_files else None
+            "status": "batch_downloaded" if len(files) > 1 else "downloaded",
+            "files": files,
+            "file_path": files[0]['path'] if files else None
         })
         
-        # Start processing
         await start_processing(chat_id)
         
     except Exception as e:
-        logger.error(f"Download failed: {str(e)}", exc_info=True)
-        await update_progress(chat_id, f"❌ Download failed: {str(e)}", force_new=True)
+        logger.error(f"Download processing failed: {str(e)}", exc_info=True)
+        await update_progress(
+            chat_id,
+            f"❌ Unexpected error during download: {str(e)}\n"
+            "Please report this issue",
+            force_new=True
+        )
         
         # Cleanup
         if chat_id in user_sessions:
@@ -677,8 +750,10 @@ async def handle_download(chat_id: int, magnet_link: str):
         if chat_id in progress_messages:
             progress_messages.pop(chat_id, None)
         if chat_id in active_tasks:
+            for task in active_tasks[chat_id]:
+                if not task.done():
+                    task.cancel()
             active_tasks.pop(chat_id, None)
-
 async def cleanup_temp_files():
     """Enhanced cleanup with better resource management"""
     while True:
