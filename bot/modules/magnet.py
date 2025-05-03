@@ -276,7 +276,7 @@ async def update_progress(
         logger.error(f"Failed to update progress: {str(e)}")
 
 async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, List[Dict]]:
-    """Download torrent and return list of media files"""
+    """Download torrent and return list of all files with video files prioritized"""
     try:
         await update_progress(chat_id, "🔍 Analyzing torrent metadata...")
         
@@ -296,6 +296,7 @@ async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, 
                     chat_id,
                     f"⬇️ Downloading torrent\n"
                     f"📊 Progress: {progress:.1f}%\n"
+                    f"📦 Downloaded: {humanize.naturalsize(downloaded)}\n"
                     f"🚀 Speed: {humanize.naturalsize(upload)}/s\n"
                     f"👥 Peers: {peers}",
                     progress=progress
@@ -313,23 +314,28 @@ async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, 
         
         await update_progress(chat_id, "✅ Torrent download complete!")
         
-        # Find all video files in the download directory
-        video_files = []
-        video_extensions = ('.mkv', '.mp4', '.avi', '.mov', '.flv', '.wmv')
+        # Find all files in the download directory
+        all_files = []
+        video_extensions = ('.mkv', '.mp4', '.avi', '.mov', '.flv', '.wmv', '.webm')
+        
         for root, _, files in os.walk(download_dir):
             for file in files:
-                if file.lower().endswith(video_extensions):
-                    file_path = ospath.join(root, file)
-                    video_files.append({
-                        'name': file,
-                        'size': ospath.getsize(file_path),
-                        'path': file_path
-                    })
+                file_path = ospath.join(root, file)
+                file_info = {
+                    'name': file,
+                    'size': ospath.getsize(file_path),
+                    'path': file_path,
+                    'is_video': file.lower().endswith(video_extensions)
+                }
+                all_files.append(file_info)
         
-        if not video_files:
-            raise ValueError("No video files found in torrent")
+        if not all_files:
+            raise ValueError("No files found in torrent")
         
-        return download_dir, video_files
+        # Sort files with videos first
+        all_files.sort(key=lambda x: not x['is_video'])
+        
+        return download_dir, all_files
         
     except Exception as e:
         logger.error(f"Torrent download failed: {str(e)}", exc_info=True)
@@ -450,7 +456,23 @@ async def process_batch(
         for idx, file_info in enumerate(files):
             file_path = file_info['path']
             
-            # Process file
+            # Skip processing for non-video files, just upload them
+            if not file_info.get('is_video', False):
+                success = await upload_file(
+                    chat_id=chat_id,
+                    file_path=file_path,
+                    upload_mode="document",  # Always upload non-video as document
+                    thumbnail_path=None,
+                    metadata=metadata,
+                    file_index=idx,
+                    total_files=total_files
+                )
+                
+                if success:
+                    uploaded_files.append(file_path)
+                continue
+            
+            # Process video files
             encoded_path = await process_single_file(
                 chat_id=chat_id,
                 file_path=file_path,
