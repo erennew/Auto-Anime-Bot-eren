@@ -3,21 +3,24 @@ import os
 import time
 import logging
 import shutil
+import re
 from pathlib import Path
 from os import path as ospath, remove as osremove, makedirs
-from typing import Optional, Dict, Callable, Tuple
+from typing import Optional, Dict, Callable, List, Tuple, Union
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, RPCError
 from torrentp import TorrentDownloader
 from datetime import datetime
-from multiprocessing import Process
+import humanize
+
 # Bot configuration
 API_ID = 24500584
 API_HASH = "449da69cf4081dc2cc74eea828d0c490"
 BOT_TOKEN = "1599848664:AAHc75il2BECWK39tiPv4pVf-gZdPt4MFcw"
 MAX_CONCURRENT_TASKS = 3
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
+MAX_TOTAL_SIZE = 10 * 1024 * 1024 * 1024  # 10GB for batch
 
 # Initialize bot
 bot = Client(
@@ -47,12 +50,42 @@ for folder in ["downloads", "encoded", "thumbnails", "watermarks", "logs"]:
 # Global session tracker
 user_sessions: Dict[int, Dict] = {}
 progress_messages: Dict[int, int] = {}
-active_tasks: Dict[int, asyncio.Task] = {}
+active_tasks: Dict[int, List[asyncio.Task]] = {}  # Now stores list of tasks
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 class VideoEncoder:
-    """Video processing without any video probing"""
+    """Enhanced video encoder with batch processing support"""
     
+    @staticmethod
+    def sanitize_filename(filename: str) -> str:
+        """Remove special characters from filename"""
+        return re.sub(r'[^\w\-_. ]', '', filename)
+
+    @staticmethod
+    async def get_video_duration(file_path: str) -> float:
+        """Get video duration in seconds using ffprobe"""
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            file_path
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        
+        if process.returncode != 0:
+            return 0.0
+            
+        try:
+            return float(stdout.decode().strip())
+        except:
+            return 0.0
+
     @staticmethod
     async def encode_with_progress(
         input_path: str,
@@ -61,120 +94,170 @@ class VideoEncoder:
         metadata: Dict[str, str],
         watermark_path: Optional[str] = None,
         thumbnail_path: Optional[str] = None,
-        progress_callback: Optional[Callable[[float], None]] = None
+        progress_callback: Optional[Callable[[float, str], None]] = None
     ) -> str:
-        """Process video with live progress updates"""
+        """Convert video with proper progress callback handling"""
         async with semaphore:
             try:
-                # 1. Basic validation
+                # 1. Validate input
                 if not ospath.exists(input_path):
-                    raise FileNotFoundError(f"Input file missing: {input_path}")
+                    raise FileNotFoundError(f"Input file not found: {input_path}")
                 
-                # 2. Build base command
+                # 2. Get clean title for metadata
+                title = metadata.get("title", "Untitled")
+                clean_title = VideoEncoder.sanitize_filename(title)
+                
+                # 3. Get video duration for progress calculation
+                duration = await VideoEncoder.get_video_duration(input_path)
+                if duration <= 0:
+                    duration = 1  # Prevent division by zero
+                
+                # 4. Build base command
                 cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', input_path]
                 
-                # 3. Original quality - just remux
-                if quality == 'original':
-                    if watermark_path and ospath.exists(watermark_path):
-                        cmd.extend([
-                            '-i', watermark_path,
-                            '-filter_complex', '[0:v][1:v]overlay=W-w-10:H-h-10[outv]',
-                            '-map', '[outv]'
-                        ])
-                    else:
-                        cmd.extend(['-map', '0:v?'])
-                    
+                # 5. Handle watermark if exists
+                if watermark_path and ospath.exists(watermark_path):
+                    cmd.extend(['-i', watermark_path])
                     cmd.extend([
-                        '-map', '0:a?',
-                        '-c', 'copy',  # Stream copy
-                        '-metadata', f'title={metadata.get("title", "")}',
-                        '-f', 'matroska',
-                        '-y',
-                        output_path
+                        '-filter_complex', '[0:v][1:v]overlay=W-w-10:H-h-10[outv]',
+                        '-map', '[outv]'
                     ])
-                
-                # 4. Other qualities - apply compression
                 else:
-                    quality_settings = {
-                        '480p': {'scale': '480', 'crf': 23},
-                        '720p': {'scale': '720', 'crf': 21}, 
-                        '1080p': {'scale': '1080', 'crf': 20}
+                    cmd.extend(['-map', '0:v?'])
+                
+                # 6. Handle quality settings
+                if quality == 'original':
+                    cmd.extend(['-c:v', 'copy'])
+                else:
+                    presets = {
+                        '480p': {'height': 480, 'crf': 23, 'preset': 'fast'},
+                        '720p': {'height': 720, 'crf': 21, 'preset': 'medium'},
+                        '1080p': {'height': 1080, 'crf': 20, 'preset': 'slow'}
                     }
                     
-                    if quality not in quality_settings:
+                    if quality not in presets:
                         raise ValueError(f"Invalid quality: {quality}")
                     
-                    filters = []
-                    video_map = '[0:v]'
-                    
-                    # Add watermark if exists
-                    if watermark_path and ospath.exists(watermark_path):
-                        cmd.extend(['-i', watermark_path])
-                        filters.append(f'[0:v][1:v]overlay=W-w-10:H-h-10[wm]')
-                        filters.append(f'[wm]scale=-2:{quality_settings[quality]["scale"]}[outv]')
-                        video_map = '[outv]'
-                    else:
-                        filters.append(f'[0:v]scale=-2:{quality_settings[quality]["scale"]}[outv]')
-                        video_map = '[outv]'
-
-                    
                     cmd.extend([
-                        '-filter_complex', ';'.join(filters),
-                        '-map', video_map,
-                        '-map', '0:a?',
+                        '-vf', f'scale=-2:{presets[quality]["height"]}',
                         '-c:v', 'libx264',
-                        '-preset', 'fast',
-                        '-crf', str(quality_settings[quality]["crf"]),
-                        '-c:a', 'aac',
-                        '-b:a', '192k',
-                        '-metadata', f'title={metadata.get("title", "")}',
-                        '-f', 'matroska',
-                        '-y',
-                        output_path
+                        '-pix_fmt', 'yuv420p',
+                        '-crf', str(presets[quality]["crf"]),
+                        '-preset', presets[quality]["preset"]
                     ])
                 
-                # 5. Execute command with progress tracking
-                logger.info(f"Running: {' '.join(cmd)}")
-                process = await asyncio.create_subprocess_exec(*cmd)
-                start = time.time()
-
+                # 7. Handle audio and subtitles
+                cmd.extend([
+                    '-map', '0:a?',
+                    '-c:a', 'copy',
+                    '-map', '0:s?',
+                    '-c:s', 'copy'
+                ])
+                
+                # 8. Add metadata for all streams
+                metadata_cmds = [
+                    '-metadata', f'title={clean_title}',
+                    '-metadata:s:v:0', f'title={clean_title}',
+                    '-metadata:s:a:0', f'title={clean_title}',
+                    '-metadata:s:s:0', f'title={clean_title}'
+                ]
+                
+                # Add additional metadata for multiple streams
+                for i in range(1, 8):
+                    metadata_cmds.extend([
+                        f'-metadata:s:a:{i}', f'title={clean_title}',
+                        f'-metadata:s:s:{i}', f'title={clean_title}'
+                    ])
+                
+                cmd.extend(metadata_cmds)
+                
+                # 9. Set output filename with clean title
+                output_filename = f"{clean_title}.mkv"
+                final_output_path = ospath.join(ospath.dirname(output_path), output_filename)
+                
+                cmd.extend([
+                    '-f', 'matroska',
+                    '-y',
+                    final_output_path
+                ])
+                
+                # 10. Execute command
+                logger.info(f"Executing: {' '.join(cmd)}")
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                # 11. Progress tracking with safe callback handling
+                start_time = time.time()
+                last_progress = 0
+                
                 while True:
-                    returncode = await process.wait()
-                    if returncode is not None:
+                    if process.returncode is not None:
                         break
-                    elapsed = time.time() - start
-                    if progress_callback:
-                        await progress_callback(min(90, elapsed * 1.5))
+                    
+                    # Get current position using ffprobe if available
+                    current_pos = 0.0
+                    if ospath.exists(final_output_path):
+                        current_pos = await VideoEncoder.get_video_duration(final_output_path)
+                    
+                    if current_pos > 0:
+                        progress = min(90, (current_pos / duration) * 90)  # 90% max for encoding
+                        
+                        # Only update if progress changed significantly
+                        if abs(progress - last_progress) >= 1 or progress >= 90:
+                            last_progress = progress
+                            if progress_callback is not None:
+                                try:
+                                    file_size = ospath.getsize(input_path)
+                                    await progress_callback(
+                                        progress,
+                                        f"Encoding: {ospath.basename(input_path)}\n"
+                                        f"Size: {humanize.naturalsize(file_size)}\n"
+                                        f"Time: {humanize.precisedelta(datetime.now() - datetime.fromtimestamp(start_time))}"
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"Progress callback error: {str(e)}")
+                    
                     await asyncio.sleep(5)
-
-                                
-                # 7. Verify success
+                
+                # 12. Verify completion
                 if process.returncode != 0:
-                    raise RuntimeError("FFmpeg processing failed")
+                    stderr = await process.stderr.read()
+                    error = stderr.decode('utf-8')[-500:] or "Unknown error"
+                    raise RuntimeError(f"FFmpeg error: {error}")
                 
-                if progress_callback:
-                    await progress_callback(100)
+                if progress_callback is not None:
+                    await progress_callback(100, "Encoding complete!")
                 
-                return output_path
-                
+                return final_output_path
+            
             except Exception as e:
-                logger.error(f"Processing error: {e}")
+                logger.error(f"Encoding failed: {str(e)}", exc_info=True)
                 if ospath.exists(output_path):
                     try:
                         osremove(output_path)
                     except:
                         pass
-                raise RuntimeError(f"Failed: {e}")
+                raise
 
-async def update_progress(chat_id: int, text: str, force_new: bool = False):
-    """Update progress message with rate limiting"""
+async def update_progress(
+    chat_id: int,
+    text: str,
+    force_new: bool = False,
+    progress: Optional[float] = None
+) -> None:
+    """Update progress message with enhanced formatting"""
     try:
-        now = time.time()
-        if chat_id in progress_messages:
-            last_update = user_sessions.get(chat_id, {}).get("last_progress_update", 0)
-            if not force_new and (now - last_update < 2):
-                return
-            
+        # Add progress bar if progress is provided
+        if progress is not None:
+            progress_bar = "[" + "■" * int(progress / 10) + "□" * (10 - int(progress / 10)) + "]"
+            text = f"{text}\n\n{progress_bar} {progress:.1f}%"
+        
+        # Add timestamp
+        text = f"{text}\n\n⏱️ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
         if chat_id in progress_messages and not force_new:
             try:
                 await bot.edit_message_text(
@@ -182,211 +265,398 @@ async def update_progress(chat_id: int, text: str, force_new: bool = False):
                     message_id=progress_messages[chat_id],
                     text=text
                 )
-                user_sessions[chat_id]["last_progress_update"] = now
                 return
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-            except RPCError:
+            except:
                 pass
         
-        msg = await bot.send_message(chat_id, text)
-        progress_messages[chat_id] = msg.id
-        if chat_id in user_sessions:
-            user_sessions[chat_id]["last_progress_update"] = now
-            
+        # If editing failed or we need a new message
+        msg = await bot.send_message(chat_id=chat_id, text=text)
+        progress_messages[chat_id] = msg.id  # Changed from msg.message_id to msg.id
     except Exception as e:
-        logger.error(f"Progress update failed: {str(e)}")
+        logger.error(f"Failed to update progress: {str(e)}")
 
+async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, List[Dict]]:
+    """Download torrent and return list of media files"""
+    try:
+        await update_progress(chat_id, "🔍 Analyzing torrent metadata...")
+        
+        # Create download directory
+        download_dir = ospath.join("downloads", f"dl_{chat_id}_{int(time.time())}")
+        makedirs(download_dir, exist_ok=True)
+        
+        # Initialize torrent downloader
+        torrent_downloader = TorrentDownloader(magnet_link, download_dir)
+        
+        # Start download with progress tracking
+        await update_progress(chat_id, "⬇️ Starting torrent download...")
+        
+        def progress_callback(progress: float, downloaded: int, upload: int, peers: int):
+            asyncio.create_task(
+                update_progress(
+                    chat_id,
+                    f"⬇️ Downloading torrent\n"
+                    f"📊 Progress: {progress:.1f}%\n"
+                    f"🚀 Speed: {humanize.naturalsize(upload)}/s\n"
+                    f"👥 Peers: {peers}",
+                    progress=progress
+                )
+            )
+        
+        # Start download
+        download_task = asyncio.create_task(
+            asyncio.to_thread(torrent_downloader.start_download, progress_callback=progress_callback)
+        )
+        
+        # Wait for download to complete
+        while not download_task.done():
+            await asyncio.sleep(5)
+        
+        await update_progress(chat_id, "✅ Torrent download complete!")
+        
+        # Find all video files in the download directory
+        video_files = []
+        video_extensions = ('.mkv', '.mp4', '.avi', '.mov', '.flv', '.wmv')
+        for root, _, files in os.walk(download_dir):
+            for file in files:
+                if file.lower().endswith(video_extensions):
+                    file_path = ospath.join(root, file)
+                    video_files.append({
+                        'name': file,
+                        'size': ospath.getsize(file_path),
+                        'path': file_path
+                    })
+        
+        if not video_files:
+            raise ValueError("No video files found in torrent")
+        
+        return download_dir, video_files
+        
+    except Exception as e:
+        logger.error(f"Torrent download failed: {str(e)}", exc_info=True)
+        if 'download_dir' in locals() and ospath.exists(download_dir):
+            shutil.rmtree(download_dir, ignore_errors=True)
+        raise
+async def process_single_file(
+    chat_id: int,
+    file_path: str,
+    output_dir: str,
+    quality: str,
+    metadata: Dict[str, str],
+    watermark_path: Optional[str],
+    thumbnail_path: Optional[str],
+    file_index: int,
+    total_files: int
+) -> Optional[str]:
+    """Process a single file with progress tracking"""
+    try:
+        # Define progress callback
+        async def progress_callback(progress: float, status: str):
+            await update_progress(
+                chat_id,
+                f"🔧 Processing file {file_index + 1}/{total_files}\n"
+                f"📄 {ospath.basename(file_path)}\n"
+                f"{status}",
+                progress=progress
+            )
+        
+        # Process file
+        encoded_path = await VideoEncoder.encode_with_progress(
+            input_path=file_path,
+            output_path=ospath.join(output_dir, f"temp_{file_index}.mkv"),
+            quality=quality,
+            metadata=metadata,
+            watermark_path=watermark_path,
+            thumbnail_path=thumbnail_path,
+            progress_callback=progress_callback
+        )
+        
+        return encoded_path
+        
+    except Exception as e:
+        logger.error(f"Failed to process {file_path}: {str(e)}")
+        await update_progress(chat_id, f"❌ Failed to process {ospath.basename(file_path)}: {str(e)}")
+        return None
+
+async def upload_file(
+    chat_id: int,
+    file_path: str,
+    upload_mode: str,
+    thumbnail_path: Optional[str],
+    metadata: Dict[str, str],
+    file_index: int,
+    total_files: int
+) -> bool:
+    """Upload a file with progress tracking"""
+    try:
+        # Define upload progress callback
+        async def upload_progress(current, total):
+            progress = (current / total) * 100
+            await update_progress(
+                chat_id,
+                f"📤 Uploading file {file_index + 1}/{total_files}\n"
+                f"📄 {ospath.basename(file_path)}\n"
+                f"📦 {humanize.naturalsize(current)}/{humanize.naturalsize(total)}",
+                progress=progress
+            )
+        
+        # Get file size for caption
+        file_size = ospath.getsize(file_path)
+        
+        # Send file
+        if upload_mode == "document":
+            await bot.send_document(
+                chat_id=chat_id,
+                document=file_path,
+                thumb=thumbnail_path,
+                caption=f"📄 {metadata.get('title', 'File')} ({humanize.naturalsize(file_size)})",
+                progress=upload_progress
+            )
+        else:
+            await bot.send_video(
+                chat_id=chat_id,
+                video=file_path,
+                thumb=thumbnail_path,
+                caption=f"🎬 {metadata.get('title', 'Video')} ({humanize.naturalsize(file_size)})",
+                progress=upload_progress
+            )
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to upload {file_path}: {str(e)}")
+        await update_progress(chat_id, f"❌ Failed to upload {ospath.basename(file_path)}: {str(e)}")
+        return False
+
+async def process_batch(
+    chat_id: int,
+    files: List[Dict],
+    quality: str,
+    metadata: Dict[str, str],
+    watermark_path: Optional[str],
+    thumbnail_path: Optional[str],
+    upload_mode: str
+) -> None:
+    """Process a batch of files with proper tracking"""
+    try:
+        # Create output directory
+        output_dir = ospath.join("encoded", f"batch_{chat_id}_{int(time.time())}")
+        makedirs(output_dir, exist_ok=True)
+        
+        total_files = len(files)
+        processed_files = []
+        uploaded_files = []
+        
+        # Process each file
+        for idx, file_info in enumerate(files):
+            file_path = file_info['path']
+            
+            # Process file
+            encoded_path = await process_single_file(
+                chat_id=chat_id,
+                file_path=file_path,
+                output_dir=output_dir,
+                quality=quality,
+                metadata=metadata,
+                watermark_path=watermark_path,
+                thumbnail_path=thumbnail_path,
+                file_index=idx,
+                total_files=total_files
+            )
+            
+            if encoded_path:
+                processed_files.append(encoded_path)
+                
+                # Upload file
+                success = await upload_file(
+                    chat_id=chat_id,
+                    file_path=encoded_path,
+                    upload_mode=upload_mode,
+                    thumbnail_path=thumbnail_path,
+                    metadata=metadata,
+                    file_index=idx,
+                    total_files=total_files
+                )
+                
+                if success:
+                    uploaded_files.append(encoded_path)
+        
+        # Final status
+        success_count = len(uploaded_files)
+        await update_progress(
+            chat_id,
+            f"✅ Batch processing complete!\n"
+            f"📊 {success_count}/{total_files} files processed successfully",
+            force_new=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Batch processing failed: {str(e)}", exc_info=True)
+        await update_progress(chat_id, f"❌ Batch processing failed: {str(e)}", force_new=True)
+    finally:
+        # Cleanup
+        try:
+            for file_path in processed_files:
+                if ospath.exists(file_path):
+                    osremove(file_path)
+            
+            if 'output_dir' in locals() and ospath.exists(output_dir):
+                shutil.rmtree(output_dir, ignore_errors=True)
+        except Exception as e:
+            logger.error(f"Cleanup error: {str(e)}")
+
+async def start_processing(chat_id: int):
+    """Handle processing for both single and batch files"""
+    try:
+        session = user_sessions.get(chat_id)
+        if not session:
+            return await update_progress(chat_id, "❌ No active session found", force_new=True)
+        
+        if session["status"] == "downloaded":
+            # Single file processing
+            file_path = session["file_path"]
+            files = [{'path': file_path, 'size': ospath.getsize(file_path)}]
+        elif session["status"] == "batch_downloaded":
+            # Batch processing
+            files = session["files"]
+        else:
+            return await update_progress(chat_id, "❌ No downloaded files found", force_new=True)
+        
+        # Start processing task
+        task = asyncio.create_task(process_batch(
+            chat_id=chat_id,
+            files=files,
+            quality=session.get("quality", "720p"),
+            metadata=session.get("metadata", {}),
+            watermark_path=session.get("watermark"),
+            thumbnail_path=session.get("thumbnail"),
+            upload_mode=session.get("upload_mode", "video")
+        ))
+        
+        # Store task
+        if chat_id not in active_tasks:
+            active_tasks[chat_id] = []
+        active_tasks[chat_id].append(task)
+        
+        # Wait for task to complete
+        try:
+            await task
+        except asyncio.CancelledError:
+            await update_progress(chat_id, "⏹️ Processing cancelled", force_new=True)
+        except Exception as e:
+            logger.error(f"Processing error: {str(e)}", exc_info=True)
+        
+    except Exception as e:
+        logger.error(f"Processing failed: {str(e)}", exc_info=True)
+        await update_progress(chat_id, f"❌ Processing failed: {str(e)}", force_new=True)
+    finally:
+        # Cleanup
+        try:
+            if "session" in locals():
+                if "download_path" in session:
+                    shutil.rmtree(session["download_path"], ignore_errors=True)
+                if "file_path" in session and ospath.exists(session["file_path"]):
+                    osremove(session["file_path"])
+        
+            if chat_id in user_sessions:
+                user_sessions.pop(chat_id, None)
+            if chat_id in progress_messages:
+                progress_messages.pop(chat_id, None)
+            if chat_id in active_tasks:
+                for t in active_tasks[chat_id]:
+                    if not t.done():
+                        t.cancel()
+                active_tasks.pop(chat_id, None)
+        except Exception as e:
+            logger.error(f"Cleanup error: {str(e)}")  # <-- This part was missing!
+
+# Now this can be defined safely
 async def ask_for_quality(chat_id: int):
-    """Show quality selection menu"""
+    """Show quality selection menu with visual indicators"""
     buttons = [
         [
-            InlineKeyboardButton("480p", callback_data=f"quality_480p_{chat_id}"),
-            InlineKeyboardButton("720p", callback_data=f"quality_720p_{chat_id}")
+            InlineKeyboardButton("🎥 480p", callback_data=f"quality_480p_{chat_id}"),
+            InlineKeyboardButton("🎥 720p", callback_data=f"quality_720p_{chat_id}")
         ],
         [
-            InlineKeyboardButton("1080p", callback_data=f"quality_1080p_{chat_id}"),
-            InlineKeyboardButton("Original", callback_data=f"quality_original_{chat_id}")
+            InlineKeyboardButton("🎥 1080p", callback_data=f"quality_1080p_{chat_id}"),
+            InlineKeyboardButton("📼 Original", callback_data=f"quality_original_{chat_id}")
         ]
     ]
     await bot.send_message(
         chat_id,
-        "🎚 Select video quality:",
+        "**🎚 Select Video Quality**\n\n"
+        "Choose the output quality for your video:",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 async def collect_settings(chat_id: int):
-    """Show settings menu"""
+    """Enhanced settings menu with batch options"""
+    session = user_sessions.get(chat_id, {})
+    
+    # Build quality indicator
+    quality = session.get("quality", "720p")
+    quality_icon = "🟢" if quality != "original" else "🔵"
+    
+    # Build upload mode indicator
+    upload_mode = session.get("upload_mode", "video")
+    upload_icon = "🎥" if upload_mode == "video" else "📄"
+    
     buttons = [
         [
-            InlineKeyboardButton("📏 Quality", callback_data=f"set_quality_{chat_id}"),
-            InlineKeyboardButton("📝 Title", callback_data=f"set_title_{chat_id}")
+            InlineKeyboardButton(f"{quality_icon} Quality: {quality}", callback_data=f"set_quality_{chat_id}"),
+            InlineKeyboardButton("✏️ Title", callback_data=f"set_title_{chat_id}")
         ],
         [
             InlineKeyboardButton("🖼️ Thumbnail", callback_data=f"set_thumb_{chat_id}"),
             InlineKeyboardButton("💧 Watermark", callback_data=f"set_wm_{chat_id}")
         ],
         [
-            InlineKeyboardButton("🚀 Start", callback_data=f"confirm_download_{chat_id}")
+            InlineKeyboardButton(f"{upload_icon} Upload as {'Video' if upload_mode == 'video' else 'Document'}", 
+                               callback_data=f"toggle_upload_{chat_id}")
+        ],
+        [
+            InlineKeyboardButton("🚀 Start Processing", callback_data=f"confirm_download_{chat_id}")
         ]
     ]
+    
     await bot.send_message(
         chat_id,
-        "⚙️ <b>Encoding Settings</b>\n\nConfigure your video options:",
+        "**⚙️ Encoding Settings**\n\n"
+        "Configure your processing options:",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 async def handle_download(chat_id: int, magnet_link: str):
-    """Handle torrent download with progress"""
+    """Handle torrent download and processing"""
     try:
-        if chat_id not in user_sessions or user_sessions[chat_id].get("status") != "ready_to_download":
-            return await bot.send_message(chat_id, "❌ Settings not configured")
+        await update_progress(chat_id, "Starting download...")
         
-        download_path = ospath.join("downloads", f"dl_{chat_id}_{int(time.time())}")
-        makedirs(download_path, exist_ok=True)
+        # Download torrent
+        download_dir, video_files = await handle_torrent_download(chat_id, magnet_link)
         
-        await update_progress(chat_id, "⚡ Starting download...", force_new=True)
-
-        # Initialize downloader
-        downloader = TorrentDownloader(magnet_link, download_path)
+        # Update session
         user_sessions[chat_id].update({
-            "status": "downloading",
-            "download_path": download_path,
-            "downloader": downloader,
-            "start_time": time.time()
-        })
-
-        # Start download
-        download_task = asyncio.create_task(downloader.start_download())
-        active_tasks[chat_id] = download_task
-
-        # Progress tracking
-        last_size = 0
-        while not download_task.done():
-            await asyncio.sleep(10)
-            try:
-                current_size = sum(f.stat().st_size for f in Path(download_path).rglob('*') if f.is_file())
-                elapsed = time.time() - user_sessions[chat_id]["start_time"]
-                speed = (current_size - last_size) / elapsed / 1024 if elapsed > 0 else 0
-                
-                await update_progress(
-                    chat_id,
-                    f"📥 Downloading...\n"
-                    f"⏱️ Elapsed: {datetime.utcfromtimestamp(elapsed).strftime('%H:%M:%S')}\n"
-                    f"🚀 Speed: {speed:.1f} KB/s\n"
-                    f"📦 Downloaded: {current_size/(1024*1024):.1f} MB"
-                )
-                last_size = current_size
-            except Exception as e:
-                logger.warning(f"Progress update error: {str(e)}")
-
-        await download_task
-        del active_tasks[chat_id]
-        
-        # Get largest downloaded file
-        downloaded_files = [
-            (f.stat().st_size, str(f)) 
-            for f in Path(download_path).rglob('*') 
-            if f.is_file() and not f.name.endswith('.tmp')
-        ]
-        
-        if not downloaded_files:
-            raise Exception("No valid files found after download")
-
-        file_path = max(downloaded_files, key=lambda x: x[0])[1]
-        user_sessions[chat_id].update({
-            "file_path": file_path,
-            "status": "downloaded"
+            "download_path": download_dir,
+            "status": "batch_downloaded" if len(video_files) > 1 else "downloaded",
+            "files": video_files,
+            "file_path": video_files[0]['path'] if video_files else None
         })
         
+        # Start processing
         await start_processing(chat_id)
         
     except Exception as e:
         logger.error(f"Download failed: {str(e)}", exc_info=True)
         await update_progress(chat_id, f"❌ Download failed: {str(e)}", force_new=True)
+        
+        # Cleanup
         if chat_id in user_sessions:
             user_sessions.pop(chat_id, None)
+        if chat_id in progress_messages:
+            progress_messages.pop(chat_id, None)
         if chat_id in active_tasks:
             active_tasks.pop(chat_id, None)
 
-async def start_processing(chat_id: int):
-    """Handle video processing and upload"""
-    try:
-        session = user_sessions.get(chat_id)
-        if not session or session["status"] != "downloaded":
-            return await update_progress(chat_id, "❌ No downloaded files found", force_new=True)
-        
-        file_path = session["file_path"]
-        output_path = ospath.join("encoded", f"encoded_{ospath.basename(file_path)}.mkv")
-        
-        await update_progress(chat_id, "🔄 Starting video processing...")
-        
-        async def progress_callback(progress: float):
-            """Update processing progress"""
-            await update_progress(
-                chat_id,
-                f"🔧 Processing...\n"
-                f"📊 Progress: {progress:.1f}%\n"
-                f"📁 File: {ospath.basename(file_path)}"
-            )
-        
-        try:
-            # Process video
-            encoded_path = await VideoEncoder.encode_with_progress(
-                input_path=file_path,
-                output_path=output_path,
-                quality=session.get("quality", "original"),
-                metadata=session.get("metadata", {}),
-                watermark_path=session.get("watermark"),
-                thumbnail_path=session.get("thumbnail"),
-                progress_callback=progress_callback
-            )
-            
-            # Upload with progress
-            await update_progress(chat_id, "☁️ Starting video upload...")
-            
-            # Upload callback
-            async def upload_progress(current, total):
-                progress = (current / total) * 100
-                await update_progress(
-                    chat_id,
-                    f"📤 Uploading...\n"
-                    f"📊 Progress: {progress:.1f}%\n"
-                    f"🔼 {current//(1024*1024)}MB / {total//(1024*1024)}MB"
-                )
-            
-            # Send video (Pyrogram will detect properties automatically)
-            await bot.send_video(
-                chat_id=chat_id,
-                video=encoded_path,
-                thumb=session.get("thumbnail"),
-                caption=f"🎬 {session.get('metadata', {}).get('title', 'Video')}",
-                progress=upload_progress
-            )
-            
-        except Exception as e:
-            raise Exception(f"Processing failed: {str(e)}")
-        finally:
-            # Cleanup
-            try:
-                if ospath.exists(output_path):
-                    osremove(output_path)
-                if ospath.exists(file_path):
-                    osremove(file_path)
-                if "download_path" in session:
-                    shutil.rmtree(session["download_path"], ignore_errors=True)
-            except Exception as e:
-                logger.error(f"Cleanup error: {str(e)}")
-        
-        await update_progress(chat_id, "✅ Processing completed successfully!", force_new=True)
-        
-    except Exception as e:
-        logger.error(f"Processing failed: {str(e)}", exc_info=True)
-        await update_progress(chat_id, f"❌ Processing failed: {str(e)}", force_new=True)
-    finally:
-        user_sessions.pop(chat_id, None)
-        progress_messages.pop(chat_id, None)
-        active_tasks.pop(chat_id, None)
 async def cleanup_temp_files():
     """Enhanced cleanup with better resource management"""
     while True:
@@ -466,7 +736,8 @@ async def magnet_handler(client: Client, message: Message):
         "magnet_link": magnet_link,
         "status": "configuring",
         "metadata": {},
-        "quality": "720p"  # Default quality
+        "quality": "720p", # Default quality
+        "upload_mode": "video"  
     }
     await collect_settings(chat_id)
 
@@ -481,7 +752,7 @@ async def quality_handler(client: Client, query):
     """Handle quality selection"""
     quality = query.data.split("_")[1]
     chat_id = int(query.data.split("_")[2])
-    
+
     if chat_id not in user_sessions:
         return await query.answer("Session expired!", show_alert=True)
     
@@ -522,6 +793,21 @@ async def set_wm_handler(client: Client, query):
     user_sessions[chat_id]["awaiting"] = "watermark"
     await query.message.edit_text("💧 Please send the watermark as photo")
 
+@bot.on_callback_query(filters.regex(r"^toggle_upload_(\d+)$"))
+async def toggle_upload_handler(client: Client, query):
+    """Toggle upload mode between video and document"""
+    chat_id = int(query.data.split("_")[2])
+    
+    if chat_id not in user_sessions:
+        return await query.answer("Session expired!", show_alert=True)
+    
+    current_mode = user_sessions[chat_id].get("upload_mode", "video")
+    new_mode = "document" if current_mode == "video" else "video"
+    user_sessions[chat_id]["upload_mode"] = new_mode
+    
+    await query.answer(f"Upload mode set to {new_mode}")
+    await collect_settings(chat_id)
+
 @bot.on_callback_query(filters.regex(r"^confirm_download_(\d+)$"))
 async def confirm_download_handler(client: Client, query):
     """Start download after settings"""
@@ -538,25 +824,30 @@ async def confirm_download_handler(client: Client, query):
 async def handle_user_input(client: Client, message: Message):
     """Handle user inputs for settings"""
     chat_id = message.chat.id
-    
+
     if chat_id not in user_sessions or "awaiting" not in user_sessions[chat_id]:
         return
-    
-    if user_sessions[chat_id]["awaiting"] == "title" and message.text:
+
+    awaiting = user_sessions[chat_id]["awaiting"]
+
+    # Handle title
+    if awaiting == "title" and message.text:
         user_sessions[chat_id]["metadata"]["title"] = message.text
         user_sessions[chat_id].pop("awaiting")
         await message.reply(f"✅ Title set: {message.text}")
         await collect_settings(chat_id)
-    
-    elif user_sessions[chat_id]["awaiting"] == "thumbnail" and message.photo:
+
+    # Handle thumbnail
+    elif awaiting == "thumbnail" and message.photo:
         thumb_path = ospath.join("thumbnails", f"thumb_{chat_id}.jpg")
         await message.download(thumb_path)
         user_sessions[chat_id]["thumbnail"] = thumb_path
         user_sessions[chat_id].pop("awaiting")
         await message.reply("✅ Thumbnail saved!")
         await collect_settings(chat_id)
-    
-    elif user_sessions[chat_id]["awaiting"] == "watermark" and message.photo:
+
+    # Handle watermark
+    elif awaiting == "watermark" and message.photo:
         wm_path = ospath.join("watermarks", f"wm_{chat_id}.png")
         await message.download(wm_path)
         user_sessions[chat_id]["watermark"] = wm_path
@@ -569,10 +860,12 @@ async def cancel_handler(client: Client, message: Message):
     """Handle cancel command"""
     chat_id = message.chat.id
     if chat_id in active_tasks:
-        active_tasks[chat_id].cancel()
-        await message.reply("⏹️ Current task cancelled")
+        for task in active_tasks[chat_id]:
+            if not task.done():
+                task.cancel()
+        await message.reply("⏹️ All active tasks cancelled")
     else:
-        await message.reply("❌ No active task to cancel")
+        await message.reply("❌ No active tasks to cancel")
 
 @bot.on_message(filters.command("status") & filters.private)
 async def status_handler(client: Client, message: Message):
