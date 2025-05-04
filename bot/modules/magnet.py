@@ -54,6 +54,50 @@ progress_messages: Dict[int, int] = {}
 active_tasks: Dict[int, List[asyncio.Task]] = {}  # Now stores list of tasks
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
+class FloodControl:
+    def __init__(self):
+        self.last_request_time = {}
+        self.wait_times = {}
+
+    async def wait_if_needed(self, chat_id: int):
+        """Handle flood waits with exponential backoff"""
+        now = time.time()
+        
+        # Check if we're already in a wait period
+        if chat_id in self.wait_times and now < self.wait_times[chat_id]:
+            remaining = self.wait_times[chat_id] - now
+            await asyncio.sleep(remaining)
+            return
+        
+        # Apply rate limiting
+        if chat_id in self.last_request_time:
+            elapsed = now - self.last_request_time[chat_id]
+            if elapsed < 2:  # Minimum 2 seconds between requests
+                wait_time = min(60, 2 ** (int(elapsed) + 1)  # Exponential backoff with 60s max
+                self.wait_times[chat_id] = now + wait_time
+                await asyncio.sleep(wait_time)
+        
+        self.last_request_time[chat_id] = now
+
+flood_control = FloodControl()
+
+async def safe_edit_message(message, text, max_retries=3):
+    """Safely edit message with flood control"""
+    for attempt in range(max_retries):
+        try:
+            await flood_control.wait_if_needed(message.chat.id)
+            return await message.edit_text(text)
+        except FloodWait as e:
+            wait_time = e.value
+            logger.warning(f"Flood wait: sleeping {wait_time} seconds (attempt {attempt + 1})")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            logger.error(f"Failed to edit message: {str(e)}")
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(1)
+    return None
+
 class VideoEncoder:
     """Enhanced video encoder with batch processing support"""
     
@@ -295,8 +339,9 @@ async def update_progress(
     except Exception as e:
         logger.error(f"Failed to update progress: {str(e)}")
         return last_update_time, progress_messages.get(chat_id)
+
 async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, List[Dict]]:
-    """Robust torrent downloader with flood control"""
+    """Robust torrent downloader with proper stall detection"""
     download_dir = ospath.join("downloads", f"dl_{chat_id}_{int(time.time())}")
     makedirs(download_dir, exist_ok=True)
     
@@ -309,7 +354,8 @@ async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, 
         # Track download status
         start_time = time.time()
         last_size = 0
-        stall_count = 0
+        last_progress_time = time.time()
+        stall_threshold = 60  # 60 seconds for stall detection
         
         def run_download():
             try:
@@ -327,7 +373,6 @@ async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, 
         while download_thread.is_alive():
             await asyncio.sleep(5)  # Check every 5 seconds
             
-            # Calculate download progress
             try:
                 current_size = 0
                 file_count = 0
@@ -339,13 +384,20 @@ async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, 
                                 current_size += ospath.getsize(file_path)
                                 file_count += 1
                 
-                # Check for stalled download
-                if current_size <= last_size:
-                    stall_count += 1
-                    if stall_count > 12:  # 60 seconds without progress
-                        raise ValueError("Download stalled - no progress for 60 seconds")
+                # Calculate progress percentage
+                if hasattr(torrent_downloader, 'total_size') and torrent_downloader.total_size > 0:
+                    progress_percent = (current_size / torrent_downloader.total_size) * 100
                 else:
-                    stall_count = 0
+                    progress_percent = 0
+                
+                # Reset stall timer if progress is being made
+                if current_size > last_size:
+                    last_progress_time = time.time()
+                
+                # Check for stalled download only if we have a total size reference
+                if hasattr(torrent_downloader, 'total_size') and torrent_downloader.total_size > 0:
+                    if time.time() - last_progress_time > stall_threshold:
+                        raise ValueError(f"Download stalled - no progress for {stall_threshold} seconds")
                 
                 last_size = current_size
                 
@@ -360,7 +412,7 @@ async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, 
                     f"📄 Files: {file_count}\n"
                     f"🚀 Speed: {speed}\n"
                     f"⏱️ Elapsed: {humanize.precisedelta(elapsed)}",
-                    progress=min(99, (elapsed/600)*100),
+                    progress=min(99, progress_percent),
                     last_update_time=last_update_time
                 )
                 
@@ -403,6 +455,7 @@ async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, 
             except Exception as e:
                 logger.error(f"Cleanup failed: {str(e)}")
         raise ValueError(f"Download failed: {str(e)}")
+
 async def process_single_file(
     chat_id: int,
     file_path: str,
@@ -443,8 +496,7 @@ async def process_single_file(
         logger.error(f"Failed to process {file_path}: {str(e)}")
         await update_progress(chat_id, f"❌ Failed to process {ospath.basename(file_path)}: {str(e)}")
         return None
-
-async def upload_file(
+async def upload_file_with_progress(
     chat_id: int,
     file_path: str,
     upload_mode: str,
@@ -453,41 +505,79 @@ async def upload_file(
     file_index: int,
     total_files: int
 ) -> bool:
-    """Upload a file with progress tracking"""
+    """Upload a file with robust flood control"""
     try:
+        await flood_control.wait_if_needed(chat_id)
+        
         # Define upload progress callback
+        last_update_time = 0
+        last_progress = 0
+        
         async def upload_progress(current, total):
+            nonlocal last_update_time, last_progress
+            now = time.time()
+            
+            # Only update progress if significant change or time elapsed
             progress = (current / total) * 100
-            await update_progress(
-                chat_id,
-                f"📤 Uploading file {file_index + 1}/{total_files}\n"
-                f"📄 {ospath.basename(file_path)}\n"
-                f"📦 {humanize.naturalsize(current)}/{humanize.naturalsize(total)}",
-                progress=progress
-            )
+            if abs(progress - last_progress) > 5 or (now - last_update_time) > 10:
+                await flood_control.wait_if_needed(chat_id)
+                try:
+                    await update_progress(
+                        chat_id,
+                        f"📤 Uploading file {file_index + 1}/{total_files}\n"
+                        f"📄 {ospath.basename(file_path)}\n"
+                        f"📦 {humanize.naturalsize(current)}/{humanize.naturalsize(total)}",
+                        progress=progress
+                    )
+                    last_update_time = now
+                    last_progress = progress
+                except FloodWait as e:
+                    logger.warning(f"Upload progress flood wait: {e.value}s")
+                    await asyncio.sleep(e.value)
+                except Exception as e:
+                    logger.warning(f"Upload progress error: {str(e)}")
         
         # Get file size for caption
         file_size = ospath.getsize(file_path)
         
-        # Send file
-        if upload_mode == "document":
-            await bot.send_document(
-                chat_id=chat_id,
-                document=file_path,
-                thumb=thumbnail_path,
-                caption=f"📄 {metadata.get('title', 'File')} ({humanize.naturalsize(file_size)})",
-                progress=upload_progress
-            )
-        else:
-            await bot.send_video(
-                chat_id=chat_id,
-                video=file_path,
-                thumb=thumbnail_path,
-                caption=f"🎬 {metadata.get('title', 'Video')} ({humanize.naturalsize(file_size)})",
-                progress=upload_progress
-            )
+        # Send file with retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await flood_control.wait_if_needed(chat_id)
+                
+                if upload_mode == "document":
+                    await bot.send_document(
+                        chat_id=chat_id,
+                        document=file_path,
+                        thumb=thumbnail_path,
+                        caption=f"📄 {metadata.get('title', 'File')} ({humanize.naturalsize(file_size)})",
+                        progress=upload_progress
+                    )
+                else:
+                    await bot.send_video(
+                        chat_id=chat_id,
+                        video=file_path,
+                        thumb=thumbnail_path,
+                        caption=f"🎬 {metadata.get('title', 'Video')} ({humanize.naturalsize(file_size)})",
+                        progress=upload_progress
+                    )
+                
+                return True
+                
+            except FloodWait as e:
+                wait_time = e.value
+                logger.warning(f"Flood wait during upload: waiting {wait_time} seconds (attempt {attempt + 1}/{max_retries})")
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(wait_time)
+            except Exception as e:
+                logger.error(f"Upload failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(5)
         
-        return True
+        return False
         
     except Exception as e:
         logger.error(f"Failed to upload {file_path}: {str(e)}")
@@ -503,8 +593,12 @@ async def process_batch(
     thumbnail_path: Optional[str],
     upload_mode: str
 ) -> None:
-    """Process a batch of files with proper tracking"""
+    """Process a batch of files with enhanced flood control"""
     try:
+        # Verify quality is set
+        if not quality or quality not in ["480p", "720p", "1080p", "original"]:
+            raise ValueError("Invalid quality setting")
+            
         # Create output directory
         output_dir = ospath.join("encoded", f"batch_{chat_id}_{int(time.time())}")
         makedirs(output_dir, exist_ok=True)
@@ -513,62 +607,69 @@ async def process_batch(
         processed_files = []
         uploaded_files = []
         
-        # Process each file
+        # Process each file with rate limiting
         for idx, file_info in enumerate(files):
-            file_path = file_info['path']
-            
-            # Skip processing for non-video files, just upload them
-            if not file_info.get('is_video', False):
-                success = await upload_file(
+            try:
+                await flood_control.wait_if_needed(chat_id)
+                file_path = file_info['path']
+                
+                # Skip processing for non-video files or if quality is "original"
+                if not file_info.get('is_video', False) or quality == "original":
+                    success = await upload_file_with_progress(
+                        chat_id=chat_id,
+                        file_path=file_path,
+                        upload_mode="document" if not file_info.get('is_video', False) else upload_mode,
+                        thumbnail_path=thumbnail_path if file_info.get('is_video', False) else None,
+                        metadata=metadata,
+                        file_index=idx,
+                        total_files=total_files
+                    )
+                    
+                    if success:
+                        uploaded_files.append(file_path)
+                    continue
+                
+                # Process video files
+                encoded_path = await process_single_file(
                     chat_id=chat_id,
                     file_path=file_path,
-                    upload_mode="document",  # Always upload non-video as document
-                    thumbnail_path=None,
+                    output_dir=output_dir,
+                    quality=quality,
                     metadata=metadata,
-                    file_index=idx,
-                    total_files=total_files
-                )
-                
-                if success:
-                    uploaded_files.append(file_path)
-                continue
-            
-            # Process video files
-            encoded_path = await process_single_file(
-                chat_id=chat_id,
-                file_path=file_path,
-                output_dir=output_dir,
-                quality=quality,
-                metadata=metadata,
-                watermark_path=watermark_path,
-                thumbnail_path=thumbnail_path,
-                file_index=idx,
-                total_files=total_files
-            )
-            
-            if encoded_path:
-                processed_files.append(encoded_path)
-                
-                # Upload file
-                success = await upload_file(
-                    chat_id=chat_id,
-                    file_path=encoded_path,
-                    upload_mode=upload_mode,
+                    watermark_path=watermark_path,
                     thumbnail_path=thumbnail_path,
-                    metadata=metadata,
                     file_index=idx,
                     total_files=total_files
                 )
                 
-                if success:
-                    uploaded_files.append(encoded_path)
+                if encoded_path:
+                    processed_files.append(encoded_path)
+                    
+                    # Upload file
+                    success = await upload_file_with_progress(
+                        chat_id=chat_id,
+                        file_path=encoded_path,
+                        upload_mode=upload_mode,
+                        thumbnail_path=thumbnail_path,
+                        metadata=metadata,
+                        file_index=idx,
+                        total_files=total_files
+                    )
+                    
+                    if success:
+                        uploaded_files.append(encoded_path)
+            
+            except Exception as e:
+                logger.error(f"Failed to process file {idx + 1}/{total_files}: {str(e)}")
+                continue
         
         # Final status
         success_count = len(uploaded_files)
         await update_progress(
             chat_id,
             f"✅ Batch processing complete!\n"
-            f"📊 {success_count}/{total_files} files processed successfully",
+            f"📊 {success_count}/{total_files} files processed successfully\n"
+            f"🔧 Quality: {quality.upper()}",
             force_new=True
         )
         
@@ -587,32 +688,52 @@ async def process_batch(
         except Exception as e:
             logger.error(f"Cleanup error: {str(e)}")
 
+async def validate_session(chat_id: int) -> bool:
+    """Validate all required session parameters are set"""
+    if chat_id not in user_sessions:
+        return False
+    
+    session = user_sessions[chat_id]
+    
+    required = ["quality", "upload_mode", "status"]
+    for field in required:
+        if field not in session:
+            return False
+    
+    if session["status"] not in ["downloaded", "batch_downloaded", "quality_set"]:
+        return False
+    
+    return True
+
 async def start_processing(chat_id: int):
-    """Handle processing for both single and batch files"""
+    """Handle processing with proper session validation"""
     try:
-        session = user_sessions.get(chat_id)
-        if not session:
-            return await update_progress(chat_id, "❌ No active session found", force_new=True)
+        # Validate session first
+        if not await validate_session(chat_id):
+            await update_progress(chat_id, "❌ Invalid session configuration", force_new=True)
+            return
         
+        session = user_sessions[chat_id]
+        
+        # Get files based on session type
         if session["status"] == "downloaded":
-            # Single file processing
             file_path = session["file_path"]
-            files = [{'path': file_path, 'size': ospath.getsize(file_path)}]
+            files = [{'path': file_path, 'size': ospath.getsize(file_path), 'is_video': True}]
         elif session["status"] == "batch_downloaded":
-            # Batch processing
             files = session["files"]
         else:
-            return await update_progress(chat_id, "❌ No downloaded files found", force_new=True)
+            await update_progress(chat_id, "❌ No valid files to process", force_new=True)
+            return
         
         # Start processing task
         task = asyncio.create_task(process_batch(
             chat_id=chat_id,
             files=files,
-            quality=session.get("quality", "720p"),
+            quality=session["quality"],
             metadata=session.get("metadata", {}),
             watermark_path=session.get("watermark"),
             thumbnail_path=session.get("thumbnail"),
-            upload_mode=session.get("upload_mode", "video")
+            upload_mode=session["upload_mode"]
         ))
         
         # Store task
@@ -635,13 +756,11 @@ async def start_processing(chat_id: int):
         # Cleanup
         try:
             if "session" in locals():
-                if "download_path" in session:
+                if "download_path" in session and ospath.exists(session["download_path"]):
                     shutil.rmtree(session["download_path"], ignore_errors=True)
                 if "file_path" in session and ospath.exists(session["file_path"]):
                     osremove(session["file_path"])
         
-            if chat_id in user_sessions:
-                user_sessions.pop(chat_id, None)
             if chat_id in progress_messages:
                 progress_messages.pop(chat_id, None)
             if chat_id in active_tasks:
@@ -650,9 +769,8 @@ async def start_processing(chat_id: int):
                         t.cancel()
                 active_tasks.pop(chat_id, None)
         except Exception as e:
-            logger.error(f"Cleanup error: {str(e)}")  # <-- This part was missing!
+            logger.error(f"Cleanup error: {str(e)}")
 
-# Now this can be defined safely
 async def ask_for_quality(chat_id: int):
     """Show quality selection menu with visual indicators"""
     buttons = [
@@ -787,6 +905,7 @@ async def handle_download(chat_id: int, magnet_link: str):
                 if not task.done():
                     task.cancel()
             active_tasks.pop(chat_id, None)
+
 async def cleanup_temp_files():
     """Enhanced cleanup with better resource management"""
     while True:
@@ -879,25 +998,46 @@ async def quality_set_handler(client: Client, query):
 
 @bot.on_callback_query(filters.regex(r"^quality_(\w+)_(\d+)$"))
 async def quality_handler(client: Client, query):
-    """Handle quality selection"""
-    quality = query.data.split("_")[1]
-    chat_id = int(query.data.split("_")[2])
-
-    if chat_id not in user_sessions:
-        return await query.answer("Session expired!", show_alert=True)
-    
-    # Normalize quality parameter
-    if quality.isdigit():
-        quality = f"{quality}p"
-    
-    valid_qualities = ["480p", "720p", "1080p", "original"]
-    if quality not in valid_qualities:
-        return await query.answer("Invalid quality selected!", show_alert=True)
-    
-    user_sessions[chat_id]["quality"] = quality
-    await query.answer(f"Quality set to {quality}")
-    await query.message.edit_text(f"✅ Quality: {quality}")
-    await collect_settings(chat_id)
+    """Handle quality selection with flood control"""
+    try:
+        parts = query.data.split("_")
+        if len(parts) != 3:
+            return await query.answer("Invalid request", show_alert=True)
+            
+        quality = parts[1]
+        chat_id = int(parts[2])
+        
+        await flood_control.wait_if_needed(chat_id)
+        
+        if chat_id not in user_sessions:
+            return await query.answer("Session expired! Start over with /magnet", show_alert=True)
+        
+        # Normalize quality
+        quality = quality.lower()
+        if quality.isdigit():
+            quality = f"{quality}p"
+        
+        valid_qualities = ["480p", "720p", "1080p", "original"]
+        if quality not in valid_qualities:
+            return await query.answer("Invalid quality!", show_alert=True)
+        
+        # Update session
+        user_sessions[chat_id].update({
+            "quality": quality,
+            "status": "quality_set",
+            "last_update": time.time()
+        })
+        
+        # Confirm to user
+        await query.answer(f"Quality set to {quality}")
+        await safe_edit_message(query.message, f"✅ Selected quality: {quality.upper()}")
+        
+        # Proceed to next step
+        await collect_settings(chat_id)
+        
+    except Exception as e:
+        logger.error(f"Quality handler error: {str(e)}")
+        await query.answer("Failed to set quality!", show_alert=True)
 
 @bot.on_callback_query(filters.regex(r"^set_title_(\d+)$"))
 async def set_title_handler(client: Client, query):
@@ -905,7 +1045,7 @@ async def set_title_handler(client: Client, query):
     chat_id = int(query.data.split("_")[2])
     await query.answer("Send the title as text")
     user_sessions[chat_id]["awaiting"] = "title"
-    await query.message.edit_text("📝 Please send the title as text")
+    await safe_edit_message(query.message, "📝 Please send the title as text")
 
 @bot.on_callback_query(filters.regex(r"^set_thumb_(\d+)$"))
 async def set_thumb_handler(client: Client, query):
@@ -913,7 +1053,7 @@ async def set_thumb_handler(client: Client, query):
     chat_id = int(query.data.split("_")[2])
     await query.answer("Send the thumbnail as photo")
     user_sessions[chat_id]["awaiting"] = "thumbnail"
-    await query.message.edit_text("🖼️ Please send the thumbnail as photo")
+    await safe_edit_message(query.message, "🖼️ Please send the thumbnail as photo")
 
 @bot.on_callback_query(filters.regex(r"^set_wm_(\d+)$"))
 async def set_wm_handler(client: Client, query):
@@ -921,7 +1061,7 @@ async def set_wm_handler(client: Client, query):
     chat_id = int(query.data.split("_")[2])
     await query.answer("Send the watermark as photo")
     user_sessions[chat_id]["awaiting"] = "watermark"
-    await query.message.edit_text("💧 Please send the watermark as photo")
+    await safe_edit_message(query.message, "💧 Please send the watermark as photo")
 
 @bot.on_callback_query(filters.regex(r"^toggle_upload_(\d+)$"))
 async def toggle_upload_handler(client: Client, query):
