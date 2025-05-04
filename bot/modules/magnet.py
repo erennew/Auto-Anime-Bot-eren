@@ -247,10 +247,17 @@ async def update_progress(
     chat_id: int,
     text: str,
     force_new: bool = False,
-    progress: Optional[float] = None
-) -> None:
-    """Update progress message with enhanced formatting"""
+    progress: Optional[float] = None,
+    last_update_time: float = 0
+) -> Tuple[Optional[float], Optional[int]]:
+    """Update progress message with flood control"""
     try:
+        current_time = time.time()
+        
+        # Don't update more often than every 5 seconds unless forced
+        if current_time - last_update_time < 5 and not force_new:
+            return last_update_time, progress_messages.get(chat_id)
+        
         # Add progress bar if progress is provided
         if progress is not None:
             progress_bar = "[" + "■" * int(progress / 10) + "□" * (10 - int(progress / 10)) + "]"
@@ -261,27 +268,40 @@ async def update_progress(
         
         if chat_id in progress_messages and not force_new:
             try:
-                await bot.edit_message_text(
+                msg = await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=progress_messages[chat_id],
                     text=text
                 )
-                return
-            except:
+                return current_time, msg.id
+            except FloodWait as e:
+                logger.warning(f"Flood wait: waiting {e.value} seconds")
+                await asyncio.sleep(e.value)
+                return await update_progress(chat_id, text, force_new, progress, last_update_time)
+            except Exception:
+                # If editing fails, we'll send a new message
                 pass
         
         # If editing failed or we need a new message
-        msg = await bot.send_message(chat_id=chat_id, text=text)
-        progress_messages[chat_id] = msg.id  # Changed from msg.message_id to msg.id
+        try:
+            msg = await bot.send_message(chat_id=chat_id, text=text)
+            progress_messages[chat_id] = msg.id
+            return current_time, msg.id
+        except FloodWait as e:
+            logger.warning(f"Flood wait: waiting {e.value} seconds")
+            await asyncio.sleep(e.value)
+            return await update_progress(chat_id, text, force_new, progress, last_update_time)
+        
     except Exception as e:
         logger.error(f"Failed to update progress: {str(e)}")
+        return last_update_time, progress_messages.get(chat_id)
 async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, List[Dict]]:
-    """Robust torrent downloader with proper file verification"""
+    """Robust torrent downloader with flood control"""
     download_dir = ospath.join("downloads", f"dl_{chat_id}_{int(time.time())}")
     makedirs(download_dir, exist_ok=True)
     
     try:
-        await update_progress(chat_id, "🔍 Initializing torrent download...")
+        last_update_time, _ = await update_progress(chat_id, "🔍 Initializing torrent download...")
         
         # Initialize torrent downloader with timeout
         torrent_downloader = TorrentDownloader(magnet_link, download_dir)
@@ -293,8 +313,10 @@ async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, 
         
         def run_download():
             try:
-                # Start download (without progress_callback)
-                torrent_downloader.start_download()
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(torrent_downloader.start_download())
+                loop.close()
             except Exception as e:
                 logger.error(f"Download thread error: {str(e)}")
 
@@ -327,18 +349,19 @@ async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, 
                 
                 last_size = current_size
                 
-                # Update progress
+                # Update progress with flood control
                 elapsed = time.time() - start_time
                 speed = humanize.naturalsize(current_size/elapsed) + "/s" if elapsed > 0 else ""
                 
-                await update_progress(
+                last_update_time, _ = await update_progress(
                     chat_id,
                     f"⬇️ Downloading torrent\n"
                     f"📦 Size: {humanize.naturalsize(current_size)}\n"
                     f"📄 Files: {file_count}\n"
                     f"🚀 Speed: {speed}\n"
                     f"⏱️ Elapsed: {humanize.precisedelta(elapsed)}",
-                    progress=min(99, (elapsed/600)*100)  # Max 99% for 10 minute timeout
+                    progress=min(99, (elapsed/600)*100),
+                    last_update_time=last_update_time
                 )
                 
             except Exception as e:
@@ -364,7 +387,6 @@ async def handle_torrent_download(chat_id: int, magnet_link: str) -> Tuple[str, 
                         continue
 
         if not all_files:
-            # Additional verification
             if not os.listdir(download_dir):
                 raise ValueError("Download directory is completely empty - invalid torrent")
             else:
