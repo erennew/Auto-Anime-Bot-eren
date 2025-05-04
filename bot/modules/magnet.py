@@ -14,7 +14,8 @@ from torrentp import TorrentDownloader
 from datetime import datetime
 import humanize
 import threading
-
+import asyncio
+from asyncio.subprocess import PIPE  # Correct import
 # Bot configuration
 API_ID = 24500584
 API_HASH = "449da69cf4081dc2cc74eea828d0c490"
@@ -73,7 +74,7 @@ class FloodControl:
         if chat_id in self.last_request_time:
             elapsed = now - self.last_request_time[chat_id]
             if elapsed < 2:  # Minimum 2 seconds between requests
-                wait_time = min(60, 2 ** (int(elapsed) + 1)  # Exponential backoff with 60s max
+                wait_time = min(60, 2 ** (int(elapsed) + 1))  # Exponential backoff with 60s max
                 self.wait_times[chat_id] = now + wait_time
                 await asyncio.sleep(wait_time)
         
@@ -98,41 +99,38 @@ async def safe_edit_message(message, text, max_retries=3):
             await asyncio.sleep(1)
     return None
 
+
+
 class VideoEncoder:
-    """Enhanced video encoder with batch processing support"""
+    """Handles video encoding with progress tracking"""
     
+    def __init__(self):
+        pass
+
     @staticmethod
     def sanitize_filename(filename: str) -> str:
-        """Remove special characters from filename"""
+        """Clean filename by removing special chars"""
         return re.sub(r'[^\w\-_. ]', '', filename)
 
     @staticmethod
     async def get_video_duration(file_path: str) -> float:
-        """Get video duration in seconds using ffprobe"""
+        """Get duration using ffprobe"""
         cmd = [
             'ffprobe', '-v', 'error',
             '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1',
             file_path
         ]
-        
         process = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stdout=PIPE,
+            stderr=PIPE
         )
         stdout, _ = await process.communicate()
-        
-        if process.returncode != 0:
-            return 0.0
-            
-        try:
-            return float(stdout.decode().strip())
-        except:
-            return 0.0
+        return float(stdout.decode().strip()) if process.returncode == 0 else 0.0
 
-    @staticmethod
     async def encode_with_progress(
+        self,
         input_path: str,
         output_path: str,
         quality: str,
@@ -141,145 +139,33 @@ class VideoEncoder:
         thumbnail_path: Optional[str] = None,
         progress_callback: Optional[Callable[[float, str], None]] = None
     ) -> str:
-        """Convert video with proper progress callback handling"""
+        """Main encoding method with progress reporting"""
         async with semaphore:
             try:
-                # 1. Validate input
+                # Validate input
                 if not ospath.exists(input_path):
                     raise FileNotFoundError(f"Input file not found: {input_path}")
-                
-                # 2. Get clean title for metadata
+
+                # Prepare parameters
                 title = metadata.get("title", "Untitled")
-                clean_title = VideoEncoder.sanitize_filename(title)
+                clean_title = self.sanitize_filename(title)
+                duration = await self.get_video_duration(input_path) or 1
+                final_output = ospath.join(ospath.dirname(output_path), f"{clean_title}.mkv")
+
+                # Build FFmpeg command
+                cmd = self._build_ffmpeg_command(input_path, quality, watermark_path, clean_title, final_output)
                 
-                # 3. Get video duration for progress calculation
-                duration = await VideoEncoder.get_video_duration(input_path)
-                if duration <= 0:
-                    duration = 1  # Prevent division by zero
-                
-                # 4. Build base command
-                cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', input_path]
-                
-                # 5. Handle watermark if exists
-                if watermark_path and ospath.exists(watermark_path):
-                    cmd.extend(['-i', watermark_path])
-                    cmd.extend([
-                        '-filter_complex', '[0:v][1:v]overlay=W-w-10:H-h-10[outv]',
-                        '-map', '[outv]'
-                    ])
-                else:
-                    cmd.extend(['-map', '0:v?'])
-                
-                # 6. Handle quality settings
-                if quality == 'original':
-                    cmd.extend(['-c:v', 'copy'])
-                else:
-                    presets = {
-                        '480p': {'height': 480, 'crf': 28, 'preset': 'veryfast'},
-                        '720p': {'height': 720, 'crf': 27, 'preset': 'veryfast'},
-                        '1080p': {'height': 1080, 'crf': 26, 'preset': 'veryfast'}
-                    }
-                    
-                    if quality not in presets:
-                        raise ValueError(f"Invalid quality: {quality}")
-                    
-                    cmd.extend([
-                        '-vf', f'scale=-2:{presets[quality]["height"]}',
-                        '-c:v', 'libx264',
-                        '-pix_fmt', 'yuv420p',
-                        '-crf', str(presets[quality]["crf"]),
-                        '-preset', presets[quality]["preset"]
-                    ])
-                
-                # 7. Handle audio and subtitles
-                cmd.extend([
-                    '-map', '0:a?',
-                    '-c:a', 'copy',
-                    '-map', '0:s?',
-                    '-c:s', 'copy'
-                ])
-                
-                # 8. Add metadata for all streams
-                metadata_cmds = [
-                    '-metadata', f'title={clean_title}',
-                    '-metadata:s:v:0', f'title={clean_title}',
-                    '-metadata:s:a:0', f'title={clean_title}',
-                    '-metadata:s:s:0', f'title={clean_title}'
-                ]
-                
-                # Add additional metadata for multiple streams
-                for i in range(1, 8):
-                    metadata_cmds.extend([
-                        f'-metadata:s:a:{i}', f'title={clean_title}',
-                        f'-metadata:s:s:{i}', f'title={clean_title}'
-                    ])
-                
-                cmd.extend(metadata_cmds)
-                
-                # 9. Set output filename with clean title
-                output_filename = f"{clean_title}.mkv"
-                final_output_path = ospath.join(ospath.dirname(output_path), output_filename)
-                
-                cmd.extend([
-                    '-f', 'matroska',
-                    '-y',
-                    final_output_path
-                ])
-                
-                # 10. Execute command
-                logger.info(f"Executing: {' '.join(cmd)}")
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                # Execute and track progress
+                return await self._execute_encoding(
+                    cmd, 
+                    input_path,
+                    final_output,
+                    duration,
+                    progress_callback
                 )
-                
-                # 11. Progress tracking with safe callback handling
-                start_time = time.time()
-                last_progress = 0
-                
-                while True:
-                    if process.returncode is not None:
-                        break
-                    
-                    # Get current position using ffprobe if available
-                    current_pos = 0.0
-                    if ospath.exists(final_output_path):
-                        current_pos = await VideoEncoder.get_video_duration(final_output_path)
-                    
-                    if current_pos > 0:
-                        progress = min(90, (current_pos / duration) * 90)  # 90% max for encoding
-                        
-                        # Only update if progress changed significantly
-                        if abs(progress - last_progress) >= 1 or progress >= 90:
-                            last_progress = progress
-                            if progress_callback is not None:
-                                try:
-                                    file_size = ospath.getsize(input_path)
-                                    await progress_callback(
-                                        progress,
-                                        f"Encoding: {ospath.basename(input_path)}\n"
-                                        f"Size: {humanize.naturalsize(file_size)}\n"
-                                        f"Time: {humanize.precisedelta(datetime.now() - datetime.fromtimestamp(start_time))}"
-                                    )
-                                except Exception as e:
-                                    logger.warning(f"Progress callback error: {str(e)}")
-                    
-                    await asyncio.sleep(5)
-                
-                # 12. Verify completion
-                if process.returncode != 0:
-                    stderr = await process.stderr.read()
-                    error = stderr.decode('utf-8')[-500:] or "Unknown error"
-                    raise RuntimeError(f"FFmpeg error: {error}")
-                
-                if progress_callback is not None:
-                    await progress_callback(100, "Encoding complete!")
-                
-                return final_output_path
-            
+
             except Exception as e:
-                logger.error(f"Encoding failed: {str(e)}", exc_info=True)
+                logger.error(f"Encoding failed: {str(e)}")
                 if ospath.exists(output_path):
                     try:
                         osremove(output_path)
@@ -287,6 +173,121 @@ class VideoEncoder:
                         pass
                 raise
 
+    def _build_ffmpeg_command(
+        self,
+        input_path: str,
+        quality: str,
+        watermark_path: Optional[str],
+        title: str,
+        output_path: str
+    ) -> List[str]:
+        """Construct FFmpeg command based on parameters"""
+        presets = {
+            '480p': {'height': 480, 'crf': 28},
+            '720p': {'height': 720, 'crf': 27},
+            '1080p': {'height': 1080, 'crf': 26}
+        }
+        preset = presets.get(quality, presets['720p'])
+
+        cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', input_path]
+
+        # Handle watermark
+        if watermark_path and ospath.exists(watermark_path):
+            cmd.extend(['-i', watermark_path])
+            if quality == 'original':
+                cmd.extend([
+                    '-filter_complex', '[0:v][1:v]overlay=W-w-10:H-h-10[outv]',
+                    '-map', '[outv]',
+                    '-c:v', 'copy'
+                ])
+            else:
+                cmd.extend([
+                    '-filter_complex',
+                    f'[0:v]scale=-2:{preset["height"]}[scaled];'
+                    f'[scaled][1:v]overlay=W-w-10:H-h-10[outv]',
+                    '-map', '[outv]',
+                    '-c:v', 'libx264',
+                    '-pix_fmt', 'yuv420p',
+                    '-crf', str(preset['crf']),
+                    '-preset', 'veryfast'
+                ])
+        else:
+            # No watermark
+            cmd.extend(['-map', '0:v?'])
+            if quality == 'original':
+                cmd.extend(['-c:v', 'copy'])
+            else:
+                cmd.extend([
+                    '-vf', f'scale=-2:{preset["height"]}',
+                    '-c:v', 'libx264',
+                    '-pix_fmt', 'yuv420p',
+                    '-crf', str(preset['crf']),
+                    '-preset', 'veryfast'
+                ])
+
+        # Add audio, subtitles and metadata
+        cmd.extend([
+            '-map', '0:a?',
+            '-c:a', 'copy',
+            '-map', '0:s?',
+            '-c:s', 'copy',
+            '-metadata', f'title={title}',
+            '-metadata:s:v:0', f'title={title}',
+            '-metadata:s:a:0', f'title={title}',
+            '-metadata:s:s:0', f'title={title}',
+            '-f', 'matroska',
+            '-y',
+            output_path
+        ])
+
+        return cmd
+
+    async def _execute_encoding(
+        self,
+        cmd: List[str],
+        input_path: str,
+        output_path: str,
+        duration: float,
+        progress_callback: Optional[Callable[[float, str], None]]
+    ) -> str:
+        """Execute FFmpeg command with progress tracking"""
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=PIPE,
+            stderr=PIPE
+        )
+
+        start_time = time.time()
+        last_progress = 0
+
+        while process.returncode is None:
+            current_pos = await self.get_video_duration(output_path) if ospath.exists(output_path) else 0
+            if current_pos > 0:
+                progress = min(90, (current_pos / duration) * 90)
+                if abs(progress - last_progress) >= 1:
+                    last_progress = progress
+                    if progress_callback:
+                        try:
+                            await progress_callback(
+                                progress,
+                                f"Encoding: {ospath.basename(input_path)}\n"
+                                f"Size: {humanize.naturalsize(ospath.getsize(input_path))}\n"
+                                f"Time: {humanize.precisedelta(datetime.now() - datetime.fromtimestamp(start_time))}"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Progress callback error: {str(e)}")
+            await asyncio.sleep(5)
+
+        if process.returncode != 0:
+            error = (await process.stderr.read()).decode('utf-8')[-500:] or "Unknown error"
+            raise RuntimeError(f"FFmpeg error: {error}")
+
+        if progress_callback:
+            await progress_callback(100, "Encoding complete!")
+
+        return output_path
+
+        return output_path
 async def update_progress(
     chat_id: int,
     text: str,
@@ -480,7 +481,8 @@ async def process_single_file(
             )
         
         # Process file
-        encoded_path = await VideoEncoder.encode_with_progress(
+        encoder = VideoEncoder()
+        encoded_path = await encoder.encode_with_progress(
             input_path=file_path,
             output_path=ospath.join(output_dir, f"temp_{file_index}.mkv"),
             quality=quality,
@@ -489,6 +491,7 @@ async def process_single_file(
             thumbnail_path=thumbnail_path,
             progress_callback=progress_callback
         )
+
         
         return encoded_path
         
@@ -1136,7 +1139,111 @@ async def cancel_handler(client: Client, message: Message):
         await message.reply("⏹️ All active tasks cancelled")
     else:
         await message.reply("❌ No active tasks to cancel")
+@bot.on_message(filters.command("cleanup") & filters.private)
+async def cleanup_command(client: Client, message: Message):
+    """Command to clean all temporary folders and files"""
+    chat_id = message.chat.id
+    
+    # Only allow bot owner to perform cleanup (replace with your user ID)
+    BOT_OWNER_ID = 12345678  # Change this to your Telegram user ID
+    if message.from_user.id != BOT_OWNER_ID:
+        await message.reply("❌ Only the bot owner can perform cleanup.")
+        return
+    
+    try:
+        # Get confirmation
+        confirm_buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, clean everything", callback_data=f"cleanup_confirm_{chat_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cleanup_cancel_{chat_id}")]
+        ])
+        
+        await message.reply(
+            "⚠️ This will delete ALL temporary files and folders!\n"
+            "This includes:\n"
+            "- All downloads\n"
+            "- All encoded files\n"
+            "- All thumbnails\n"
+            "- All watermarks\n\n"
+            "Are you sure you want to continue?",
+            reply_markup=confirm_buttons
+        )
+    
+    except Exception as e:
+        logger.error(f"Cleanup command failed: {str(e)}")
+        await message.reply("❌ Failed to initiate cleanup.")
 
+@bot.on_callback_query(filters.regex(r"^cleanup_confirm_(\d+)$"))
+async def cleanup_confirmed(client: Client, query):
+    """Handle cleanup confirmation"""
+    chat_id = int(query.data.split("_")[2])
+    
+    try:
+        await query.answer("Starting cleanup...")
+        await safe_edit_message(query.message, "🧹 Starting cleanup...")
+        
+        folders_to_clean = ["downloads", "encoded", "thumbnails", "watermarks"]
+        total_deleted = 0
+        total_failed = 0
+        
+        for folder in folders_to_clean:
+            try:
+                if ospath.exists(folder):
+                    await safe_edit_message(
+                        query.message,
+                        f"🧹 Cleaning {folder}..."
+                    )
+                    
+                    # Delete all contents but keep the folder structure
+                    for filename in os.listdir(folder):
+                        file_path = ospath.join(folder, filename)
+                        try:
+                            if ospath.isfile(file_path) or ospath.islink(file_path):
+                                osremove(file_path)
+                                total_deleted += 1
+                            elif ospath.isdir(file_path):
+                                shutil.rmtree(file_path)
+                                total_deleted += 1
+                        except Exception as e:
+                            logger.warning(f"Failed to delete {file_path}: {str(e)}")
+                            total_failed += 1
+                    
+                    await asyncio.sleep(1)  # Rate limiting
+            
+            except Exception as e:
+                logger.error(f"Failed to clean {folder}: {str(e)}")
+                total_failed += 1
+        
+        # Also clean active tasks and sessions
+        if chat_id in active_tasks:
+            for task in active_tasks[chat_id]:
+                if not task.done():
+                    task.cancel()
+            active_tasks.pop(chat_id, None)
+        
+        if chat_id in user_sessions:
+            user_sessions.pop(chat_id, None)
+        
+        if chat_id in progress_messages:
+            progress_messages.pop(chat_id, None)
+        
+        result_msg = (
+            f"✅ Cleanup complete!\n"
+            f"🗑️ Deleted items: {total_deleted}\n"
+            f"❌ Failed deletions: {total_failed}\n\n"
+            f"All temporary folders have been emptied."
+        )
+        
+        await safe_edit_message(query.message, result_msg)
+    
+    except Exception as e:
+        logger.error(f"Cleanup failed: {str(e)}")
+        await safe_edit_message(query.message, f"❌ Cleanup failed: {str(e)}")
+
+@bot.on_callback_query(filters.regex(r"^cleanup_cancel_(\d+)$"))
+async def cleanup_cancelled(client: Client, query):
+    """Handle cleanup cancellation"""
+    await query.answer("Cleanup cancelled")
+    await safe_edit_message(query.message, "❌ Cleanup cancelled. No files were deleted.")
 @bot.on_message(filters.command("status") & filters.private)
 async def status_handler(client: Client, message: Message):
     """Show current status"""
